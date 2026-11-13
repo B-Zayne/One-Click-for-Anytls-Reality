@@ -22,3 +22,6 @@ Run the following command as `root` on your Linux VPS (Debian / Ubuntu / CentOS 
 
 ```bash
 bash <(wget -qO- https://raw.githubusercontent.com/B-Zayne/One-Click-for-Anytls-Reality/refs/heads/main/Any-sh-v2.sh)
+
+```bash
+apk update && apk add --no-cache bash curl && curl -fsSL https://raw.githubusercontent.com/B-Zayne/One-Click-for-Anytls-Reality/refs/heads/main/Any-sh-v2.sh -o /root/any.sh && chmod +x /root/any.sh && bash /root/any.sh
