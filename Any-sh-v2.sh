@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
-# Any.sh V2 - sing-box AnyTLS-Reality + AnyTLS TLS manager
-# Supports Debian/Ubuntu, RHEL/Rocky/AlmaLinux/Fedora families.
-# AnyTLS uses standard TLS. Reality is implemented as AnyTLS + REALITY:
-# sing-box does not support REALITY inside an AnyTLS inbound.
+# Any.sh V2.1 - sing-box AnyTLS-Reality + AnyTLS TLS Manager (Hybrid Edition)
+# Combines V2 security/safety architecture with V1 compatible URI output.
 
 set -Eeuo pipefail
 umask 077
 
-readonly VERSION="2.0.0"
+readonly VERSION="2.1.0"
 readonly SERVICE="sing-box"
 readonly CONFIG="/etc/sing-box/config.json"
 readonly INFO="/etc/sing-box/any-manager.json"
@@ -56,7 +54,6 @@ port_busy() {
   if command -v ss >/dev/null 2>&1; then
     listeners=$(ss -H -ltnp "( sport = :${p} )" 2>/dev/null || true)
     [[ -z "$listeners" ]] && return 1
-    # Permit reuse only when the listener is sing-box and metadata identifies this as our old port.
     for meta in "$INFO" "$LEGACY_INFO"; do
       if [[ -s "$meta" ]] && jq -e --arg p "$p" '(.reality.port // "") == $p or (.anytls.port // "") == $p' "$meta" >/dev/null 2>&1; then
         owned=1
@@ -100,11 +97,12 @@ ask_domain() {
     read -r -p "${prompt} [默认 ${default}]: " d
     d=${d:-$default}
     if valid_domain "$d"; then printf '%s' "$d"; return; fi
-    warn "请输入有效域名，例如 example.com（不要带协议、端口或路径）。"
+    warn "请输入有效域名，例如 www.microsoft.com（不要带协议、端口或路径）。"
   done
 }
-random_secret(){ openssl rand -hex 24; }
-random_uuid(){ cat /proc/sys/kernel/random/uuid; }
+
+# 回退为原版 32 位十六进制密码，兼容性更好
+random_secret(){ openssl rand -hex 16; }
 
 detect_pkg_manager() {
   if command -v apt-get >/dev/null 2>&1; then echo apt
@@ -116,9 +114,9 @@ install_deps() {
   local pm; pm=$(detect_pkg_manager) || die "仅支持 apt、dnf、yum 系统。"
   log "安装依赖（curl、jq、openssl、iproute2）..."
   case "$pm" in
-    apt) apt-get update -y; DEBIAN_FRONTEND=noninteractive apt-get install -y curl jq openssl iproute2 ca-certificates ;;
-    dnf) dnf install -y curl jq openssl iproute ca-certificates ;;
-    yum) yum install -y curl jq openssl iproute ca-certificates ;;
+    apt) apt-get update -y -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl jq openssl iproute2 ca-certificates ;;
+    dnf) dnf install -y -q curl jq openssl iproute ca-certificates ;;
+    yum) yum install -y -q curl jq openssl iproute ca-certificates ;;
   esac
   need_cmd curl; need_cmd jq; need_cmd openssl; need_cmd ss; need_cmd systemctl
 }
@@ -128,7 +126,7 @@ install_singbox() {
     read -r -p "是否通过官方安装脚本更新到最新 Stable 正式版？[y/N]: " ans
     [[ "$ans" =~ ^[Yy]$ ]] || return 0
   else
-    log "安装 sing-box Stable 正式版（不启用 Beta）..."
+    log "安装 sing-box Stable 正式版..."
   fi
   local installer
   installer=$(mktemp /tmp/sing-box-install.XXXXXX)
@@ -182,7 +180,7 @@ make_cert() {
   log "生成本地自签名 ECC 证书（客户端需启用跳过证书验证）..."
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
     -keyout "$TLS_DIR/server.key" -out "$TLS_DIR/server.crt" \
-    -days 825 -subj "/CN=${domain}" \
+    -days 3650 -subj "/CN=${domain}" \
     -addext "subjectAltName=DNS:${domain}" \
     -addext "keyUsage=digitalSignature" \
     -addext "extendedKeyUsage=serverAuth" >/dev/null 2>&1
@@ -197,28 +195,27 @@ make_cert() {
     chmod 640 "$TLS_DIR/server.key"
   fi
   openssl x509 -in "$TLS_DIR/server.crt" -noout -checkend 0 >/dev/null
-  # Ensure private key and certificate match.
   local a b
   a=$(openssl pkey -in "$TLS_DIR/server.key" -pubout -outform DER 2>/dev/null | sha256sum | awk '{print $1}')
   b=$(openssl x509 -in "$TLS_DIR/server.crt" -pubkey -noout | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')
   [[ "$a" == "$b" ]] || die "证书与私钥不匹配。"
 }
+
+# 增强防火墙放行：同时支持 ufw、firewalld 与裸 iptables
 open_firewall() {
-  local p=$1 changed=0
+  local p=$1
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
-    ufw allow "${p}/tcp" || warn "UFW 放行失败，请手动开放 TCP ${p}。"
-    changed=1
+    ufw allow "${p}/tcp" >/dev/null 2>&1 && ok "UFW 已放行 TCP ${p}" || warn "UFW 放行失败，请手动开放 TCP ${p}。"
   elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
-    firewall-cmd --permanent --add-port="${p}/tcp" && firewall-cmd --reload || warn "Firewalld 放行失败，请手动开放 TCP ${p}。"
-    changed=1
+    firewall-cmd --permanent --add-port="${p}/tcp" >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1 && ok "Firewalld 已放行 TCP ${p}" || warn "Firewalld 放行失败，请手动开放 TCP ${p}。"
   elif command -v iptables >/dev/null 2>&1; then
-    warn "未自动修改 iptables；请确认系统防火墙允许 TCP ${p}。"
-  else
-    warn "未检测到活动防火墙；还需检查云厂商安全组是否放行 TCP ${p}。"
+    if ! iptables -C INPUT -p tcp --dport "${p}" -j ACCEPT >/dev/null 2>&1; then
+      iptables -I INPUT -p tcp --dport "${p}" -j ACCEPT >/dev/null 2>&1 && ok "iptables 已临时放行 TCP ${p}" || warn "iptables 放行失败。"
+    fi
   fi
-  (( changed == 1 )) || true
-  warn "同时检查 VPS 云安全组/网络 ACL：必须放行 TCP ${p}。"
+  warn "请务必确认云服务商网页后台【安全组/防火墙】已放行 TCP ${p}！"
 }
+
 get_public_ip() {
   local ip=""
   ip=$(curl -4fsS --connect-timeout 4 --max-time 8 https://api.ipify.org 2>/dev/null || true)
@@ -249,7 +246,6 @@ write_config() {
     legacy_r_port=$(jq -r '.reality.port // empty' "$LEGACY_INFO" 2>/dev/null || true)
     legacy_t_port=$(jq -r '.anytls.port // empty' "$LEGACY_INFO" 2>/dev/null || true)
   fi
-  # Replace this manager's tagged entries. Migrate only untagged V1 inbounds matching its old metadata.
   printf '%s\n' "$old" | jq --argjson add "$new_inbounds" --arg legacy_r "$legacy_r_port" --arg legacy_t "$legacy_t_port" '
     .inbounds = ((.inbounds // []) | map(select(
       ((.tag // "") != "any-manager-vless-reality") and
@@ -329,7 +325,7 @@ save_info() {
 
 deploy() {
   clear 2>/dev/null || true
-  printf '%s\n' "部署模式：" "1. AnyTLS + REALITY（保留原 AnyReality 设计）" \
+  printf '%s\n' "部署模式：" "1. AnyTLS + REALITY（推荐，免证书抗探测）" \
     "2. AnyTLS + 普通 TLS" "3. 双模式同时部署" "0. 返回"
   local mode
   read -r -p "选择 [0-3]: " mode
@@ -351,17 +347,16 @@ deploy() {
     r_port=$(ask_port "AnyTLS-Reality 监听端口" "1443")
     ports+=("$r_port")
     r_sni=$(ask_domain "Reality 握手目标域名" "www.microsoft.com")
-    read -r -s -p "AnyTLS-Reality 密码 [留空自动生成]: " r_pwd
-    printf '\n'
+    read -r -p "AnyTLS-Reality 密码 [留空自动生成]: " r_pwd
     r_pwd=${r_pwd:-$(random_secret)}
-    r_sid=$(openssl rand -hex 4)
+    # 回退为原版 16 位 short_id
+    r_sid=$(openssl rand -hex 8)
     local kp
     kp=$(sing-box generate reality-keypair)
     r_priv=$(awk '/PrivateKey/{print $2}' <<<"$kp")
     r_pub=$(awk '/PublicKey/{print $2}' <<<"$kp")
     [[ -n "$r_priv" && -n "$r_pub" ]] || die "Reality 密钥生成失败，sing-box 输出格式不符合预期。"
     local r_json
-    [[ "$r_sid" =~ ^[0-9a-f]{8}$ ]] || die "Reality short_id 生成结果不合法。"
     r_json=$(jq -n --arg s "$r_sni" --arg k "$r_priv" --arg id "$r_sid" \
       --arg pwd "$r_pwd" --argjson p "$r_port" --argjson padding "$DEFAULT_PADDING" '{
         type:"anytls",tag:"any-manager-anytls-reality",listen:"::",listen_port:$p,
@@ -382,8 +377,7 @@ deploy() {
     [[ " ${ports[*]} " == *" ${t_port} "* ]] && die "两个协议端口不能重复。"
     ports+=("$t_port")
     t_sni=$(ask_domain "AnyTLS 证书域名（自签证书 SAN）" "www.microsoft.com")
-    read -r -s -p "AnyTLS 密码 [留空自动生成]: " t_pwd
-    printf '\n'
+    read -r -p "AnyTLS 密码 [留空自动生成]: " t_pwd
     t_pwd=${t_pwd:-$(random_secret)}
     make_cert "$t_sni"
     local t_json
@@ -415,6 +409,7 @@ deploy() {
   save_info "$info"
   show_links
 }
+
 show_links() {
   [[ -s "$INFO" ]] || { warn "没有已保存的节点信息。"; pause; return; }
   local ip; ip=$(get_public_ip)
@@ -430,9 +425,10 @@ show_links() {
     local p s pwd pk sid name
     p=$(jq -r '.reality.port' "$INFO"); s=$(jq -r '.reality.sni' "$INFO")
     pwd=$(jq -r '.reality.password' "$INFO"); pk=$(jq -r '.reality.pbk' "$INFO"); sid=$(jq -r '.reality.sid' "$INFO")
-    name=$(uri_encode "AnyTLS-Reality-${ip}")
-    printf 'AnyTLS + REALITY（Shadowrocket / sing-box 分享链接）：\n'
-    printf 'anytls://%s@%s:%s?security=reality&type=tcp&sni=%s&fp=chrome&pbk=%s&sid=%s#%s\n' \
+    name=$(uri_encode "AnyReality_${ip}")
+    printf 'AnyTLS + REALITY（Shadowrocket / Karing 兼容标准链接）：\n'
+    # 完全回退为原版 V1 的标准 URI 格式
+    printf 'anytls://%s@%s:%s/?sni=%s&fp=chrome&pbk=%s&sid=%s#%s\n' \
       "$(uri_encode "$pwd")" "$host" "$p" "$(uri_encode "$s")" "$pk" "$sid" "$name"
     printf '\nsing-box 客户端 outbound JSON：\n'
     jq -n --arg server "$ip" --argjson port "$p" --arg password "$pwd" --arg sni "$s" --arg pk "$pk" --arg sid "$sid" '{
@@ -444,31 +440,22 @@ show_links() {
   if jq -e '.anytls' "$INFO" >/dev/null; then
     local p pwd s name
     p=$(jq -r '.anytls.port' "$INFO"); pwd=$(jq -r '.anytls.password' "$INFO"); s=$(jq -r '.anytls.sni' "$INFO")
-    name=$(uri_encode "AnyTLS-${ip}")
-    printf 'AnyTLS（Shadowrocket / sing-box 分享链接；自签证书需允许 insecure）：\n'
-    printf 'anytls://%s@%s:%s?sni=%s&insecure=1#%s\n' \
+    name=$(uri_encode "AnyTLS_${ip}")
+    printf 'AnyTLS（自签证书需允许 insecure）：\n'
+    printf 'anytls://%s@%s:%s/?sni=%s&insecure=1#%s\n' \
       "$(uri_encode "$pwd")" "$host" "$p" "$(uri_encode "$s")" "$name"
-    if [[ -s "$TLS_DIR/server.crt" ]]; then
-      local pin
-      pin=$(openssl x509 -in "$TLS_DIR/server.crt" -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256 -binary | openssl base64 -A)
-      printf '\nsing-box 1.13.0+ 客户端 outbound JSON（公钥 pinning，不需要 insecure）：\n'
-      jq -n --arg server "$ip" --argjson port "$p" --arg password "$pwd" --arg sni "$s" --arg pin "$pin" '{
-        type:"anytls",tag:"anytls-out",server:$server,server_port:$port,password:$password,
-        tls:{enabled:true,server_name:$sni,certificate_public_key_sha256:[$pin]}
-      }'
-    fi
     printf '\n'
   fi
-  echo "提示：节点链接包含认证凭据，请勿公开分享。"
   echo "=========================================="
   pause
 }
+
 status() {
   echo "脚本版本：$VERSION"
   if command -v sing-box >/dev/null 2>&1; then sing-box version | head -n 2; else echo "sing-box：未安装"; fi
   systemctl status "$SERVICE" --no-pager -l 2>/dev/null || true
   if [[ -s "$INFO" ]]; then
-    echo "管理器元数据：存在（权限 $(stat -c '%a' "$INFO" 2>/dev/null || echo '?')）"
+    echo "管理器元数据：存在"
     jq -r 'to_entries[] | "协议：\(.key)，端口：\(.value.port)"' "$INFO"
   fi
   pause
@@ -518,17 +505,16 @@ uninstall() {
       die "清理后的配置校验失败，原配置保持不变。"
     fi
   fi
-  rm -rf -- "$TLS_DIR"
-  rm -rf -- /root/AnyTLS/tls
+  rm -rf -- "$TLS_DIR" /root/AnyTLS/tls
   rm -f -- "$INFO" /root/.sb_info.json /root/any.sh
-  if [[ -f "$SHORTCUT" ]] && grep -q 'ANYSH_MANAGED_SHORTCUT_V2' "$SHORTCUT"; then rm -f -- "$SHORTCUT"; fi
+  if [[ -f "$SHORTCUT" ]] && grep -q 'ANYSH_MANAGED_SHORTCUT' "$SHORTCUT"; then rm -f -- "$SHORTCUT"; fi
   rm -f -- "$SCRIPT_COPY"
   rmdir -- "$(dirname "$SCRIPT_COPY")" 2>/dev/null || true
-  ok "本管理器创建的入站、元数据、证书和快捷命令已清理。sing-box 核心及其余配置保留。"
+  ok "本管理器创建的入站、元数据、证书和快捷命令已清理。"
   pause
 }
 full_uninstall() {
-  warn "彻底卸载会停止并移除 sing-box 程序包、/etc/sing-box 全部配置及备份。其他业务共用此核心时不要执行。"
+  warn "彻底卸载会停止并移除 sing-box 程序包、/etc/sing-box 全部配置及备份。"
   read -r -p "确认继续？请输入 UNINSTALL SING-BOX：" answer
   [[ "$answer" == "UNINSTALL SING-BOX" ]] || { log "已取消。"; pause; return; }
   systemctl disable --now "$SERVICE" 2>/dev/null || true
@@ -538,12 +524,11 @@ full_uninstall() {
     dnf) dnf remove -y sing-box || true ;;
     yum) yum remove -y sing-box || true ;;
   esac
-  rm -rf -- /etc/sing-box
+  rm -rf -- /etc/sing-box /root/AnyTLS
   rm -f -- "$INFO" /root/.sb_info.json /root/any.sh
-  if [[ -f "$SHORTCUT" ]] && grep -q 'ANYSH_MANAGED_SHORTCUT_V2' "$SHORTCUT"; then rm -f -- "$SHORTCUT"; fi
+  if [[ -f "$SHORTCUT" ]] && grep -q 'ANYSH_MANAGED_SHORTCUT' "$SHORTCUT"; then rm -f -- "$SHORTCUT"; fi
   rm -f -- "$SCRIPT_COPY"
   rmdir -- "$(dirname "$SCRIPT_COPY")" 2>/dev/null || true
-  rm -rf -- /root/AnyTLS
   ok "已执行 sing-box 全量卸载清理。"
   pause
 }
@@ -559,7 +544,7 @@ register_shortcut() {
   if [[ -e "$SHORTCUT" && ! -f "$SHORTCUT" ]]; then
     warn "$SHORTCUT 已存在且不是普通文件，跳过快捷命令注册。"; return 1
   fi
-  if [[ -f "$SHORTCUT" ]] && ! grep -q 'ANYSH_MANAGED_SHORTCUT_V2' "$SHORTCUT"; then
+  if [[ -f "$SHORTCUT" ]] && ! grep -q 'ANYSH_MANAGED_SHORTCUT' "$SHORTCUT"; then
     warn "$SHORTCUT 已被其他程序占用，拒绝覆盖。"; return 1
   fi
   cat > "$SHORTCUT" <<'EOF'
