@@ -31,3 +31,6 @@ bash <(wget -qO- https://raw.githubusercontent.com/B-Zayne/One-Click-for-Anytls-
 ```bash
 apk update && apk add --no-cache bash curl && curl -fsSL https://raw.githubusercontent.com/B-Zayne/One-Click-for-Anytls-Reality/refs/heads/main/Any-sh-v2.sh -o /root/any.sh && chmod +x /root/any.sh && bash /root/any.sh
 ```
+
+### Alpine 128RAM
+apk update && apk add --no-cache bash curl && rm -rf /var/cache/apk/* && curl -fsSL https://raw.githubusercontent.com/B-Zayne/One-Click-for-Anytls-Reality/refs/heads/main/any-v2.2-for-alpine128.sh -o /root/any.sh && chmod +x /root/any.sh && bash /root/any.sh
