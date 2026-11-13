@@ -135,7 +135,7 @@ open_firewall_port() {
 }
 
 # ------------------------------------------------------------------------------
-# 服务控制与 128M 低内存优化层 (兼容 OpenRC 与 Systemd)
+# 服务控制与 128M 低内存优化层 (兼容 OpenRC / 无 OpenRC 容器 / Systemd)
 # ------------------------------------------------------------------------------
 svc_is_active() {
     if is_alpine; then
@@ -147,7 +147,9 @@ svc_is_active() {
 
 svc_start() {
     if is_alpine; then
-        rc-service "$SERVICE_NAME" start
+        if ! rc-service "$SERVICE_NAME" start >/dev/null 2>&1; then
+            pidof sing-box >/dev/null 2>&1 || GOGC=50 GOMEMLIMIT=64MiB nohup /usr/bin/sing-box run -c "$CONFIG_PATH" >/dev/null 2>"$LOG_FILE" &
+        fi
     else
         systemctl start "$SERVICE_NAME"
     fi
@@ -155,7 +157,8 @@ svc_start() {
 
 svc_stop() {
     if is_alpine; then
-        rc-service "$SERVICE_NAME" stop
+        rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
+        killall sing-box >/dev/null 2>&1 || true
     else
         systemctl stop "$SERVICE_NAME"
     fi
@@ -175,7 +178,10 @@ EOF
 svc_restart() {
     if is_alpine; then
         rc-update add "$SERVICE_NAME" default >/dev/null 2>&1 || true
-        rc-service "$SERVICE_NAME" restart
+        if ! rc-service "$SERVICE_NAME" restart >/dev/null 2>&1; then
+            killall sing-box >/dev/null 2>&1 || true
+            GOGC=50 GOMEMLIMIT=64MiB nohup /usr/bin/sing-box run -c "$CONFIG_PATH" >/dev/null 2>"$LOG_FILE" &
+        fi
     else
         setup_systemd_mem_limit
         systemctl daemon-reload
@@ -210,7 +216,7 @@ EOF
     rc-update add "$SERVICE_NAME" default >/dev/null 2>&1 || true
 }
 
-# 打印当前系统的安装与运行状态卡片
+# 打印当前系统的安装与运行状态卡片 (读取 /proc 原生 VmRSS 兼容所有 BusyBox)
 print_system_status() {
     echo -e "${CYAN}-----------------------------------------------------${NC}"
     if [[ -f "$CONFIG_PATH" && -f "$INFO_PATH" ]]; then
@@ -227,9 +233,13 @@ print_system_status() {
 
         if svc_is_active; then
             local pid rss_mb
-            pid=$(pidof sing-box 2>/dev/null | awk '{print $1}' || echo "未知")
-            rss_mb=$(ps -o pid,rss 2>/dev/null | awk -v p="$pid" '$1==p {printf "%.1fMB", $2/1024}' || echo "未知")
-            echo -e " 服务状态: ${GREEN}${BOLD}● 运行中${NC} (PID: ${pid} | 内存占用: ${CYAN}${rss_mb}${NC})"
+            pid=$(pidof sing-box 2>/dev/null | awk '{print $1}' || echo "")
+            if [[ -n "$pid" && -r "/proc/${pid}/status" ]]; then
+                rss_mb=$(awk '/VmRSS/ {printf "%.1fMB", $2/1024}' "/proc/${pid}/status" 2>/dev/null || echo "未知")
+            else
+                rss_mb="未知"
+            fi
+            echo -e " 服务状态: ${GREEN}${BOLD}● 运行中${NC} (PID: ${pid:-未知} | 内存占用: ${CYAN}${rss_mb}${NC})"
             echo -e " 已配置项: ${CYAN}${installed_proto}${NC} [128M低内存模式]"
         else
             echo -e " 服务状态: ${YELLOW}${BOLD}● 已安装但未运行 (已停止)${NC}"
@@ -242,10 +252,10 @@ print_system_status() {
 }
 
 # ------------------------------------------------------------------------------
-# 依赖与 Sing-Box 内核安装 (Alpine 专用静态包 + 内存盘清理)
+# 依赖与 Sing-Box 内核安装 (Alpine 专用静态包 + 磁盘目录安全解压)
 # ------------------------------------------------------------------------------
 install_singbox_alpine() {
-    local arch sb_arch latest_tag download_url tmp_dir
+    local arch sb_arch latest_tag download_url tmp_dir="/root/.sb_tmp"
     arch=$(uname -m)
     case "$arch" in
         x86_64|amd64) sb_arch="amd64" ;;
@@ -262,10 +272,10 @@ install_singbox_alpine() {
     fi
 
     download_url="https://github.com/SagerNet/sing-box/releases/download/v${latest_tag}/sing-box-${latest_tag}-linux-${sb_arch}.tar.gz"
-    tmp_dir=$(mktemp -d)
+    rm -rf "$tmp_dir" && mkdir -p "$tmp_dir"
     log_info "正在下载并流式解压 Sing-Box v${latest_tag} (${sb_arch})..."
 
-    # 采用管道流式解压，避免压缩包与解压目录同时占用 128M tmpfs 内存
+    # 使用 /root/.sb_tmp 磁盘路径流式解压，避开 /tmp 64MB 内存盘空间限制
     if curl -fsSL "$download_url" | tar -xz -C "$tmp_dir"; then
         install -m 755 "${tmp_dir}/sing-box-${latest_tag}-linux-${sb_arch}/sing-box" /usr/bin/sing-box
         rm -rf "$tmp_dir"
@@ -273,7 +283,7 @@ install_singbox_alpine() {
         log_success "Sing-Box v${latest_tag} 安装及 128M 低内存守护注册成功！"
     else
         rm -rf "$tmp_dir"
-        log_error "下载或解压 Sing-Box 失败，请检查网络连接或可用内存。"
+        log_error "下载或解压 Sing-Box 失败，请检查网络连接或磁盘空间。"
         return 1
     fi
 }
@@ -602,11 +612,18 @@ show_status() {
     echo -e "${BOLD}          Sing-Box 运行状态与内存占用               ${NC}"
     echo -e "${CYAN}=====================================================${NC}\n"
     if is_alpine; then
-        rc-service "$SERVICE_NAME" status || true
+        rc-service "$SERVICE_NAME" status 2>/dev/null || true
         echo
-        free -m || true
+        free -m 2>/dev/null || true
         echo
-        ps -o pid,rss,comm | grep -E "PID|sing-box" || true
+        local pid rss_mb
+        pid=$(pidof sing-box 2>/dev/null | awk '{print $1}' || echo "")
+        if [[ -n "$pid" && -r "/proc/${pid}/status" ]]; then
+            rss_mb=$(awk '/VmRSS/ {printf "%.1f MB", $2/1024}' "/proc/${pid}/status" 2>/dev/null || echo "未知")
+            echo -e " Sing-Box 进程 PID: ${GREEN}${pid}${NC} | 实际物理内存 (VmRSS): ${GREEN}${rss_mb}${NC}"
+        else
+            echo -e " Sing-Box 进程: ${RED}未运行${NC}"
+        fi
     else
         systemctl status "$SERVICE_NAME" --no-pager || true
     fi
@@ -642,6 +659,7 @@ uninstall_all() {
         if is_alpine; then
             rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
             rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true
+            killall sing-box >/dev/null 2>&1 || true
             rm -f /etc/init.d/"$SERVICE_NAME" "$LOG_FILE"
         else
             systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
@@ -651,7 +669,7 @@ uninstall_all() {
         fi
 
         rm -f /usr/bin/"$SERVICE_NAME" /usr/local/bin/"$SERVICE_NAME" /usr/local/bin/any /usr/bin/any "$LOCAL_SCRIPT_PATH"
-        rm -rf /etc/"$SERVICE_NAME" "$INFO_PATH" /root/AnyTLS
+        rm -rf /etc/"$SERVICE_NAME" "$INFO_PATH" /root/AnyTLS /root/.sb_tmp
 
         log_success "Sing-Box 及脚本组件已彻底清理卸载完成！"
     else
