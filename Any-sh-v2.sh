@@ -1,589 +1,682 @@
 #!/usr/bin/env bash
-# Any.sh V2.1 - sing-box AnyTLS-Reality + AnyTLS TLS Manager (Hybrid Edition)
-# Combines V2 security/safety architecture with V1 compatible URI output.
 
-set -Eeuo pipefail
-umask 077
+set -eo pipefail
 
-readonly VERSION="2.1.0"
-readonly SERVICE="sing-box"
-readonly CONFIG="/etc/sing-box/config.json"
-readonly INFO="/etc/sing-box/any-manager.json"
-readonly LEGACY_INFO="/root/.sb_info.json"
-readonly TLS_DIR="/etc/sing-box/anytls"
-readonly SCRIPT_COPY="/usr/local/lib/any-manager/Any.sh"
-readonly SHORTCUT="/usr/local/bin/any"
-readonly BACKUP_DIR="/etc/sing-box/backup"
-readonly DEFAULT_PADDING='["stop=8","0=30-30","1=100-400","2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000","3=9-9,500-1000","4=500-1000","5=500-1000","6=500-1000","7=500-1000"]'
+# ------------------------------------------------------------------------------
+# 全局变量与路径定义
+# ------------------------------------------------------------------------------
+readonly CONFIG_PATH="/etc/sing-box/config.json"
+readonly INFO_PATH="/root/.sb_info.json"
+readonly TLS_DIR="/root/AnyTLS/tls"
+readonly LOG_FILE="/var/log/sing-box.log"
+readonly SERVICE_NAME="sing-box"
+readonly LOCAL_SCRIPT_PATH="/root/any.sh"
 
-RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'
-BLUE=$'\033[0;34m'; CYAN=$'\033[0;36m'; RESET=$'\033[0m'
+# 颜色与样式
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[0;33m'
+readonly BLUE='\033[0;34m'
+readonly CYAN='\033[0;36m'
+readonly BOLD='\033[1m'
+readonly NC='\033[0m'
 
-log()  { printf '%s[INFO]%s %s\n' "$BLUE" "$RESET" "$*"; }
-ok()   { printf '%s[ OK ]%s %s\n' "$GREEN" "$RESET" "$*"; }
-warn() { printf '%s[WARN]%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
-err()  { printf '%s[ERR ]%s %s\n' "$RED" "$RESET" "$*" >&2; }
-pause(){ read -r -p "按 Enter 继续..." _ || true; }
-die(){ err "$*"; return 1; }
-
-on_error() {
-  local rc=$?
-  err "脚本在第 ${BASH_LINENO[0]:-未知} 行发生错误（退出码 ${rc}）。"
-  if command -v systemctl >/dev/null 2>&1; then
-    warn "可查看日志：journalctl -u ${SERVICE} -n 80 --no-pager"
-  fi
-  exit "$rc"
-}
-trap on_error ERR
-
-require_root() {
-  [[ ${EUID} -eq 0 ]] || { err "请使用 root 用户运行：sudo bash Any.sh"; exit 1; }
+# ------------------------------------------------------------------------------
+# 系统环境识别
+# ------------------------------------------------------------------------------
+is_alpine() {
+    [[ -f /etc/alpine-release ]] || command -v apk &>/dev/null
 }
 
-need_cmd() { command -v "$1" >/dev/null 2>&1 || { err "缺少命令：$1"; return 1; }; }
+# ------------------------------------------------------------------------------
+# 辅助 UI 与工具函数
+# ------------------------------------------------------------------------------
+log_info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
+log_success() { echo -e "${GREEN}[OK]${NC} $1"; }
+log_warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 
-valid_port() {
-  [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+pause() {
+    echo -e "\n${YELLOW}按回车键继续...${NC}"
+    read -r
 }
-valid_domain() {
-  local d=$1
-  [[ ${#d} -le 253 && "$d" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]
-}
-port_busy() {
-  local p=$1 listeners="" owned=0 meta
-  if command -v ss >/dev/null 2>&1; then
-    listeners=$(ss -H -ltnp "( sport = :${p} )" 2>/dev/null || true)
-    [[ -z "$listeners" ]] && return 1
-    for meta in "$INFO" "$LEGACY_INFO"; do
-      if [[ -s "$meta" ]] && jq -e --arg p "$p" '(.reality.port // "") == $p or (.anytls.port // "") == $p' "$meta" >/dev/null 2>&1; then
-        owned=1
-        break
-      fi
-    done
-    if (( owned == 1 )) && grep -q 'users:(("sing-box"' <<<"$listeners"; then
-      return 1
+
+check_root() {
+    if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+        log_error "本脚本需要 Root 权限运行，请切换到 Root 用户后再试。"
+        exit 1
     fi
-    return 0
-  elif command -v lsof >/dev/null 2>&1; then
-    for meta in "$INFO" "$LEGACY_INFO"; do
-      if [[ -s "$meta" ]] && jq -e --arg p "$p" '(.reality.port // "") == $p or (.anytls.port // "") == $p' "$meta" >/dev/null 2>&1; then
-        owned=1
-        break
-      fi
-    done
-    if (( owned == 1 )) && lsof -nP -iTCP:"$p" -sTCP:LISTEN -c sing-box >/dev/null 2>&1; then
-      return 1
+}
+
+# ------------------------------------------------------------------------------
+# 全局快捷指令注册 ('any' 命令)
+# ------------------------------------------------------------------------------
+force_register_shortcut() {
+    if [[ -s "$0" && "$0" != "/dev/fd/"* && "$0" != "/proc/"* && "$0" != "bash" && "$0" != "-bash" ]]; then
+        cp -f "$0" "$LOCAL_SCRIPT_PATH" 2>/dev/null || true
     fi
-    lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1
-  else
-    warn "无法检测端口占用（缺少 ss/lsof）；请自行确认。"
-    return 1
-  fi
-}
+    chmod +x "$LOCAL_SCRIPT_PATH" 2>/dev/null || true
 
-ask_port() {
-  local prompt=$1 default=$2 p
-  while true; do
-    read -r -p "${prompt} [默认 ${default}]: " p
-    p=${p:-$default}
-    if ! valid_port "$p"; then warn "端口必须是 1-65535 的整数。"; continue; fi
-    if port_busy "$p"; then warn "TCP ${p} 已被监听，请更换。"; continue; fi
-    printf '%s' "$p"; return
-  done
-}
-ask_domain() {
-  local prompt=$1 default=$2 d
-  while true; do
-    read -r -p "${prompt} [默认 ${default}]: " d
-    d=${d:-$default}
-    if valid_domain "$d"; then printf '%s' "$d"; return; fi
-    warn "请输入有效域名，例如 www.microsoft.com（不要带协议、端口或路径）。"
-  done
-}
-
-# 回退为原版 32 位十六进制密码，兼容性更好
-random_secret(){ openssl rand -hex 16; }
-
-detect_pkg_manager() {
-  if command -v apt-get >/dev/null 2>&1; then echo apt
-  elif command -v dnf >/dev/null 2>&1; then echo dnf
-  elif command -v yum >/dev/null 2>&1; then echo yum
-  else return 1; fi
-}
-install_deps() {
-  local pm; pm=$(detect_pkg_manager) || die "仅支持 apt、dnf、yum 系统。"
-  log "安装依赖（curl、jq、openssl、iproute2）..."
-  case "$pm" in
-    apt) apt-get update -y -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl jq openssl iproute2 ca-certificates ;;
-    dnf) dnf install -y -q curl jq openssl iproute ca-certificates ;;
-    yum) yum install -y -q curl jq openssl iproute ca-certificates ;;
-  esac
-  need_cmd curl; need_cmd jq; need_cmd openssl; need_cmd ss; need_cmd systemctl
-}
-install_singbox() {
-  if command -v sing-box >/dev/null 2>&1; then
-    log "检测到 sing-box：$(sing-box version | head -n 1)"
-    read -r -p "是否通过官方安装脚本更新到最新 Stable 正式版？[y/N]: " ans
-    [[ "$ans" =~ ^[Yy]$ ]] || return 0
-  else
-    log "安装 sing-box Stable 正式版..."
-  fi
-  local installer
-  installer=$(mktemp /tmp/sing-box-install.XXXXXX)
-  chmod 700 "$installer"
-  if ! curl --proto '=https' --tlsv1.2 -fsSL https://sing-box.app/install.sh -o "$installer"; then
-    rm -f -- "$installer"
-    die "无法从 sing-box 官方站点下载安装脚本。"
-  fi
-  if ! bash "$installer"; then
-    rm -f -- "$installer"
-    die "sing-box 官方安装脚本执行失败。"
-  fi
-  rm -f -- "$installer"
-  need_cmd sing-box
-  sing-box version
-}
-require_anytls_version() {
-  local version
-  version=$(sing-box version | awk '/sing-box version/ {print $3; exit}')
-  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || die "无法识别 sing-box 版本：$version"
-  if [[ "$(printf '%s\n' 1.12.0 "$version" | sort -V | head -n1)" != "1.12.0" ]]; then
-    die "AnyTLS 入站要求 sing-box 1.12.0 或更新版本；当前版本：$version"
-  fi
-}
-prepare_dirs() {
-  install -d -m 700 /etc/sing-box "$BACKUP_DIR" "$TLS_DIR" "$(dirname "$SCRIPT_COPY")"
-  local svc_user svc_group
-  svc_user=$(systemctl show -p User --value "$SERVICE" 2>/dev/null || true)
-  if [[ -n "$svc_user" ]]; then
-    svc_group=$(id -gn "$svc_user" 2>/dev/null || printf '%s' "$svc_user")
-    chown root:"$svc_group" /etc/sing-box
-    chmod 750 /etc/sing-box
-  else
-    chmod 700 /etc/sing-box
-  fi
-  chmod 700 "$TLS_DIR" "$BACKUP_DIR"
-}
-LAST_BACKUP=""
-backup_current() {
-  LAST_BACKUP=""
-  if [[ -s "$CONFIG" ]]; then
-    local stamp; stamp=$(date +%Y%m%d-%H%M%S)
-    LAST_BACKUP="$BACKUP_DIR/config-${stamp}.json"
-    cp -a "$CONFIG" "$LAST_BACKUP"
-    chmod 600 "$LAST_BACKUP"
-    log "已备份原配置：$LAST_BACKUP"
-  fi
-}
-make_cert() {
-  local domain=$1
-  log "生成本地自签名 ECC 证书（客户端需启用跳过证书验证）..."
-  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
-    -keyout "$TLS_DIR/server.key" -out "$TLS_DIR/server.crt" \
-    -days 3650 -subj "/CN=${domain}" \
-    -addext "subjectAltName=DNS:${domain}" \
-    -addext "keyUsage=digitalSignature" \
-    -addext "extendedKeyUsage=serverAuth" >/dev/null 2>&1
-  chmod 600 "$TLS_DIR/server.key"
-  chmod 644 "$TLS_DIR/server.crt"
-  local svc_user svc_group
-  svc_user=$(systemctl show -p User --value "$SERVICE" 2>/dev/null || true)
-  if [[ -n "$svc_user" ]]; then
-    svc_group=$(id -gn "$svc_user" 2>/dev/null || printf '%s' "$svc_user")
-    chown root:"$svc_group" "$TLS_DIR" "$TLS_DIR/server.key" "$TLS_DIR/server.crt"
-    chmod 750 "$TLS_DIR"
-    chmod 640 "$TLS_DIR/server.key"
-  fi
-  openssl x509 -in "$TLS_DIR/server.crt" -noout -checkend 0 >/dev/null
-  local a b
-  a=$(openssl pkey -in "$TLS_DIR/server.key" -pubout -outform DER 2>/dev/null | sha256sum | awk '{print $1}')
-  b=$(openssl x509 -in "$TLS_DIR/server.crt" -pubkey -noout | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')
-  [[ "$a" == "$b" ]] || die "证书与私钥不匹配。"
-}
-
-# 增强防火墙放行：同时支持 ufw、firewalld 与裸 iptables
-open_firewall() {
-  local p=$1
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
-    ufw allow "${p}/tcp" >/dev/null 2>&1 && ok "UFW 已放行 TCP ${p}" || warn "UFW 放行失败，请手动开放 TCP ${p}。"
-  elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
-    firewall-cmd --permanent --add-port="${p}/tcp" >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1 && ok "Firewalld 已放行 TCP ${p}" || warn "Firewalld 放行失败，请手动开放 TCP ${p}。"
-  elif command -v iptables >/dev/null 2>&1; then
-    if ! iptables -C INPUT -p tcp --dport "${p}" -j ACCEPT >/dev/null 2>&1; then
-      iptables -I INPUT -p tcp --dport "${p}" -j ACCEPT >/dev/null 2>&1 && ok "iptables 已临时放行 TCP ${p}" || warn "iptables 放行失败。"
-    fi
-  fi
-  warn "请务必确认云服务商网页后台【安全组/防火墙】已放行 TCP ${p}！"
-}
-
-get_public_ip() {
-  local ip=""
-  ip=$(curl -4fsS --connect-timeout 4 --max-time 8 https://api.ipify.org 2>/dev/null || true)
-  if [[ -z "$ip" ]]; then ip=$(curl -6fsS --connect-timeout 4 --max-time 8 https://api64.ipify.org 2>/dev/null || true); fi
-  if [[ "$ip" =~ ^[0-9a-fA-F:.]+$ ]]; then printf '%s' "$ip"; else printf 'YOUR_SERVER_IP'; fi
-}
-uri_encode() {
-  jq -rn --arg v "$1" '$v|@uri'
-}
-ensure_systemd() {
-  systemctl daemon-reload
-  systemctl enable "$SERVICE" >/dev/null
-}
-config_base() {
-  if [[ -s "$CONFIG" ]]; then
-    jq -e 'type == "object" and (.inbounds == null or (.inbounds|type=="array"))' "$CONFIG" >/dev/null \
-      || die "现有 $CONFIG 不是可识别的 sing-box JSON 配置，已停止以避免覆盖。"
-    cat "$CONFIG"
-  else
-    jq -n '{log:{level:"info",timestamp:true},inbounds:[],outbounds:[{type:"direct",tag:"direct"}]}'
-  fi
-}
-write_config() {
-  local new_inbounds=$1 tmp old legacy_r_port="" legacy_t_port=""
-  tmp=$(mktemp "${CONFIG}.XXXXXX")
-  old=$(config_base)
-  if [[ -s "$LEGACY_INFO" ]]; then
-    legacy_r_port=$(jq -r '.reality.port // empty' "$LEGACY_INFO" 2>/dev/null || true)
-    legacy_t_port=$(jq -r '.anytls.port // empty' "$LEGACY_INFO" 2>/dev/null || true)
-  fi
-  printf '%s\n' "$old" | jq --argjson add "$new_inbounds" --arg legacy_r "$legacy_r_port" --arg legacy_t "$legacy_t_port" '
-    .inbounds = ((.inbounds // []) | map(select(
-      ((.tag // "") != "any-manager-vless-reality") and
-      ((.tag // "") != "any-manager-anytls-reality") and
-      ((.tag // "") != "any-manager-anytls") and
-      ((.tag // "") != "in-vless-reality") and
-      ((.tag // "") != "in-anytls") and
-      (((.tag // "") == "" and (.type // "") == "anytls" and (.tls.reality.enabled // false) == true and $legacy_r != "" and ((.listen_port // 0)|tostring) == $legacy_r) | not) and
-      (((.tag // "") == "" and (.type // "") == "anytls" and (.tls.certificate_path // "") == "/root/AnyTLS/tls/server.crt" and $legacy_t != "" and ((.listen_port // 0)|tostring) == $legacy_t) | not)
-    )) + $add)
-    | .outbounds = (if ((.outbounds // []) | length) == 0 then [{"type":"direct","tag":"direct"}] else .outbounds end)
-    | .log = (.log // {"level":"info","timestamp":true})
-  ' > "$tmp"
-  chmod 600 "$tmp"
-  if ! sing-box check -c "$tmp"; then
-    rm -f -- "$tmp"
-    die "Sing-box 配置检查失败，原配置未更改。"
-  fi
-  backup_current
-  mv -f "$tmp" "$CONFIG"
-  local svc_user svc_group
-  svc_user=$(systemctl show -p User --value "$SERVICE" 2>/dev/null || true)
-  if [[ -n "$svc_user" ]]; then
-    svc_group=$(id -gn "$svc_user" 2>/dev/null || printf '%s' "$svc_user")
-    chown root:"$svc_group" "$CONFIG"
-    chmod 640 "$CONFIG"
-  else
-    chmod 600 "$CONFIG"
-  fi
-}
-set_runtime_permissions() {
-  local run_user run_group
-  run_user=$(systemctl show -p User --value "$SERVICE" 2>/dev/null || true)
-  if [[ -z "$run_user" || "$run_user" == root ]]; then
-    chmod 700 /etc/sing-box
-    [[ -d "$TLS_DIR" ]] && chmod 700 "$TLS_DIR"
-    [[ -f "$TLS_DIR/server.key" ]] && chmod 600 "$TLS_DIR/server.key"
-    [[ -f "$TLS_DIR/server.crt" ]] && chmod 644 "$TLS_DIR/server.crt"
-    [[ -f "$CONFIG" ]] && chmod 600 "$CONFIG"
-  else
-    run_group=$(id -gn "$run_user" 2>/dev/null || printf '%s' "$run_user")
-    chown root:"$run_group" /etc/sing-box "$CONFIG"
-    chmod 750 /etc/sing-box
-    chmod 640 "$CONFIG"
-    if [[ -d "$TLS_DIR" ]]; then
-      chown root:"$run_group" "$TLS_DIR"
-      chmod 750 "$TLS_DIR"
-    fi
-    if [[ -f "$TLS_DIR/server.key" ]]; then
-      chown root:"$run_group" "$TLS_DIR/server.key"
-      chmod 640 "$TLS_DIR/server.key"
-    fi
-    if [[ -f "$TLS_DIR/server.crt" ]]; then
-      chown root:"$run_group" "$TLS_DIR/server.crt"
-      chmod 644 "$TLS_DIR/server.crt"
-    fi
-  fi
-}
-
-restart_checked() {
-  ensure_systemd
-  if systemctl restart "$SERVICE" && systemctl is-active --quiet "$SERVICE"; then
-    ok "sing-box 已成功启动。"
-  else
-    err "服务启动失败。"
-    journalctl -u "$SERVICE" -n 60 --no-pager || true
-    return 1
-  fi
-}
-save_info() {
-  local obj=$1 tmp
-  tmp=$(mktemp "${INFO}.XXXXXX")
-  printf '%s\n' "$obj" > "$tmp"
-  chmod 600 "$tmp"
-  mv -f "$tmp" "$INFO"
-}
-
-deploy() {
-  clear 2>/dev/null || true
-  printf '%s\n' "部署模式：" "1. AnyTLS + REALITY（推荐，免证书抗探测）" \
-    "2. AnyTLS + 普通 TLS" "3. 双模式同时部署" "0. 返回"
-  local mode
-  read -r -p "选择 [0-3]: " mode
-  [[ "$mode" == 0 ]] && return
-  [[ "$mode" =~ ^[123]$ ]] || { warn "无效选项"; pause; return; }
-
-  install_deps
-  install_singbox
-  require_anytls_version
-  prepare_dirs
-  [[ -f /root/.sb_info.json ]] && chmod 600 /root/.sb_info.json
-
-  local inbounds='[]' info='{}' ports=()
-  local r_port="" r_pwd="" r_priv="" r_pub="" r_sid="" r_sni=""
-  local t_port="" t_pwd="" t_sni=""
-
-  if [[ "$mode" == 1 || "$mode" == 3 ]]; then
-    echo
-    r_port=$(ask_port "AnyTLS-Reality 监听端口" "1443")
-    ports+=("$r_port")
-    r_sni=$(ask_domain "Reality 握手目标域名" "www.microsoft.com")
-    read -r -p "AnyTLS-Reality 密码 [留空自动生成]: " r_pwd
-    r_pwd=${r_pwd:-$(random_secret)}
-    # 回退为原版 16 位 short_id
-    r_sid=$(openssl rand -hex 8)
-    local kp
-    kp=$(sing-box generate reality-keypair)
-    r_priv=$(awk '/PrivateKey/{print $2}' <<<"$kp")
-    r_pub=$(awk '/PublicKey/{print $2}' <<<"$kp")
-    [[ -n "$r_priv" && -n "$r_pub" ]] || die "Reality 密钥生成失败，sing-box 输出格式不符合预期。"
-    local r_json
-    r_json=$(jq -n --arg s "$r_sni" --arg k "$r_priv" --arg id "$r_sid" \
-      --arg pwd "$r_pwd" --argjson p "$r_port" --argjson padding "$DEFAULT_PADDING" '{
-        type:"anytls",tag:"any-manager-anytls-reality",listen:"::",listen_port:$p,
-        users:[{name:"user",password:$pwd}],padding_scheme:$padding,
-        tls:{enabled:true,server_name:$s,reality:{
-          enabled:true,handshake:{server:$s,server_port:443},
-          private_key:$k,short_id:[$id]
-        }}
-      }')
-    inbounds=$(jq --argjson x "$r_json" '. + [$x]' <<<"$inbounds")
-    info=$(jq --arg p "$r_port" --arg s "$r_sni" --arg pwd "$r_pwd" --arg pk "$r_pub" --arg id "$r_sid" \
-      '. + {reality:{port:$p,sni:$s,password:$pwd,pbk:$pk,sid:$id}}' <<<"$info")
-  fi
-
-  if [[ "$mode" == 2 || "$mode" == 3 ]]; then
-    echo
-    t_port=$(ask_port "AnyTLS 监听端口" "2026")
-    [[ " ${ports[*]} " == *" ${t_port} "* ]] && die "两个协议端口不能重复。"
-    ports+=("$t_port")
-    t_sni=$(ask_domain "AnyTLS 证书域名（自签证书 SAN）" "www.microsoft.com")
-    read -r -p "AnyTLS 密码 [留空自动生成]: " t_pwd
-    t_pwd=${t_pwd:-$(random_secret)}
-    make_cert "$t_sni"
-    local t_json
-    t_json=$(jq -n --arg pwd "$t_pwd" --argjson p "$t_port" --argjson padding "$DEFAULT_PADDING" \
-      --arg cert "$TLS_DIR/server.crt" --arg key "$TLS_DIR/server.key" '{
-        type:"anytls",tag:"any-manager-anytls",listen:"::",listen_port:$p,
-        users:[{name:"user",password:$pwd}],padding_scheme:$padding,
-        tls:{enabled:true,certificate_path:$cert,key_path:$key}
-      }')
-    inbounds=$(jq --argjson x "$t_json" '. + [$x]' <<<"$inbounds")
-    info=$(jq --arg p "$t_port" --arg pwd "$t_pwd" --arg s "$t_sni" \
-      '. + {anytls:{port:$p,password:$pwd,sni:$s,insecure:true}}' <<<"$info")
-  fi
-
-  write_config "$inbounds"
-  for p in "${ports[@]}"; do open_firewall "$p"; done
-  if ! restart_checked; then
-    err "新配置启动失败，正在恢复上一份配置。"
-    if [[ -n "$LAST_BACKUP" && -s "$LAST_BACKUP" ]]; then
-      cp -a "$LAST_BACKUP" "$CONFIG"
-      set_runtime_permissions || true
-      systemctl restart "$SERVICE" || true
-    else
-      rm -f "$CONFIG"
-      systemctl stop "$SERVICE" || true
-    fi
-    return 1
-  fi
-  save_info "$info"
-  show_links
-}
-
-show_links() {
-  [[ -s "$INFO" ]] || { warn "没有已保存的节点信息。"; pause; return; }
-  local ip; ip=$(get_public_ip)
-  if [[ "$ip" == "YOUR_SERVER_IP" ]]; then
-    read -r -p "无法自动获取公网 IP，请输入服务器 IP 或域名: " ip
-    [[ -n "$ip" ]] || { warn "未提供服务器地址。"; pause; return; }
-  fi
-  local host="$ip"
-  [[ "$ip" == *:* ]] && host="[$ip]"
-  echo
-  echo "================ 节点链接 ================"
-  if jq -e '.reality' "$INFO" >/dev/null; then
-    local p s pwd pk sid name
-    p=$(jq -r '.reality.port' "$INFO"); s=$(jq -r '.reality.sni' "$INFO")
-    pwd=$(jq -r '.reality.password' "$INFO"); pk=$(jq -r '.reality.pbk' "$INFO"); sid=$(jq -r '.reality.sid' "$INFO")
-    name=$(uri_encode "AnyReality_${ip}")
-    printf 'AnyTLS + REALITY（Shadowrocket / Karing 兼容标准链接）：\n'
-    # 完全回退为原版 V1 的标准 URI 格式
-    printf 'anytls://%s@%s:%s/?sni=%s&fp=chrome&pbk=%s&sid=%s#%s\n' \
-      "$(uri_encode "$pwd")" "$host" "$p" "$(uri_encode "$s")" "$pk" "$sid" "$name"
-    printf '\nsing-box 客户端 outbound JSON：\n'
-    jq -n --arg server "$ip" --argjson port "$p" --arg password "$pwd" --arg sni "$s" --arg pk "$pk" --arg sid "$sid" '{
-      type:"anytls",tag:"anytls-reality-out",server:$server,server_port:$port,password:$password,
-      tls:{enabled:true,server_name:$sni,utls:{enabled:true,fingerprint:"chrome"},reality:{enabled:true,public_key:$pk,short_id:$sid}}
-    }'
-    printf '\n'
-  fi
-  if jq -e '.anytls' "$INFO" >/dev/null; then
-    local p pwd s name
-    p=$(jq -r '.anytls.port' "$INFO"); pwd=$(jq -r '.anytls.password' "$INFO"); s=$(jq -r '.anytls.sni' "$INFO")
-    name=$(uri_encode "AnyTLS_${ip}")
-    printf 'AnyTLS（自签证书需允许 insecure）：\n'
-    printf 'anytls://%s@%s:%s/?sni=%s&insecure=1#%s\n' \
-      "$(uri_encode "$pwd")" "$host" "$p" "$(uri_encode "$s")" "$name"
-    printf '\n'
-  fi
-  echo "=========================================="
-  pause
-}
-
-status() {
-  echo "脚本版本：$VERSION"
-  if command -v sing-box >/dev/null 2>&1; then sing-box version | head -n 2; else echo "sing-box：未安装"; fi
-  systemctl status "$SERVICE" --no-pager -l 2>/dev/null || true
-  if [[ -s "$INFO" ]]; then
-    echo "管理器元数据：存在"
-    jq -r 'to_entries[] | "协议：\(.key)，端口：\(.value.port)"' "$INFO"
-  fi
-  pause
-}
-logs(){ journalctl -u "$SERVICE" -n 60 -f --no-pager; }
-service_menu() {
-  echo "1. 启动  2. 停止  3. 重启  4. 检查配置  0. 返回"
-  local a; read -r -p "选择: " a
-  case "$a" in
-    1) systemctl start "$SERVICE";;
-    2) systemctl stop "$SERVICE";;
-    3) systemctl restart "$SERVICE";;
-    4) sing-box check -c "$CONFIG";;
-    0) return;;
-    *) warn "无效选项";;
-  esac
-  pause
-}
-uninstall() {
-  warn "卸载将移除本管理器添加的入站和证书，不会自动卸载 sing-box 核心，也不会删除其他入站。"
-  read -r -p "确认卸载本管理器配置？输入 YES: " answer
-  [[ "$answer" == YES ]] || { log "已取消。"; pause; return; }
-  if [[ -s "$CONFIG" ]] && command -v jq >/dev/null 2>&1; then
-    local tmp; tmp=$(mktemp "${CONFIG}.XXXXXX")
-    backup_current
-    local legacy_r_port="" legacy_t_port=""
-    if [[ -s "$LEGACY_INFO" ]]; then
-      legacy_r_port=$(jq -r '.reality.port // empty' "$LEGACY_INFO" 2>/dev/null || true)
-      legacy_t_port=$(jq -r '.anytls.port // empty' "$LEGACY_INFO" 2>/dev/null || true)
-    fi
-    jq --arg legacy_r "$legacy_r_port" --arg legacy_t "$legacy_t_port" 'del(.inbounds[] | select(
-      (.tag // "") == "any-manager-vless-reality" or
-      (.tag // "") == "any-manager-anytls-reality" or
-      (.tag // "") == "any-manager-anytls" or
-      (.tag // "") == "in-vless-reality" or
-      (.tag // "") == "in-anytls" or
-      ((.tag // "") == "" and (.type // "") == "anytls" and (.tls.reality.enabled // false) == true and $legacy_r != "" and ((.listen_port // 0)|tostring) == $legacy_r) or
-      ((.tag // "") == "" and (.type // "") == "anytls" and (.tls.certificate_path // "") == "/root/AnyTLS/tls/server.crt" and $legacy_t != "" and ((.listen_port // 0)|tostring) == $legacy_t)
-    ))' "$CONFIG" > "$tmp"
-    chmod 600 "$tmp"
-    if sing-box check -c "$tmp"; then
-      mv -f "$tmp" "$CONFIG"
-      set_runtime_permissions
-      systemctl restart "$SERVICE" || warn "服务重启失败，请检查日志。"
-    else
-      rm -f -- "$tmp"
-      die "清理后的配置校验失败，原配置保持不变。"
-    fi
-  fi
-  rm -rf -- "$TLS_DIR" /root/AnyTLS/tls
-  rm -f -- "$INFO" /root/.sb_info.json /root/any.sh
-  if [[ -f "$SHORTCUT" ]] && grep -q 'ANYSH_MANAGED_SHORTCUT' "$SHORTCUT"; then rm -f -- "$SHORTCUT"; fi
-  rm -f -- "$SCRIPT_COPY"
-  rmdir -- "$(dirname "$SCRIPT_COPY")" 2>/dev/null || true
-  ok "本管理器创建的入站、元数据、证书和快捷命令已清理。"
-  pause
-}
-full_uninstall() {
-  warn "彻底卸载会停止并移除 sing-box 程序包、/etc/sing-box 全部配置及备份。"
-  read -r -p "确认继续？请输入 UNINSTALL SING-BOX：" answer
-  [[ "$answer" == "UNINSTALL SING-BOX" ]] || { log "已取消。"; pause; return; }
-  systemctl disable --now "$SERVICE" 2>/dev/null || true
-  local pm; pm=$(detect_pkg_manager || true)
-  case "$pm" in
-    apt) DEBIAN_FRONTEND=noninteractive apt-get purge -y sing-box || true ;;
-    dnf) dnf remove -y sing-box || true ;;
-    yum) yum remove -y sing-box || true ;;
-  esac
-  rm -rf -- /etc/sing-box /root/AnyTLS
-  rm -f -- "$INFO" /root/.sb_info.json /root/any.sh
-  if [[ -f "$SHORTCUT" ]] && grep -q 'ANYSH_MANAGED_SHORTCUT' "$SHORTCUT"; then rm -f -- "$SHORTCUT"; fi
-  rm -f -- "$SCRIPT_COPY"
-  rmdir -- "$(dirname "$SCRIPT_COPY")" 2>/dev/null || true
-  ok "已执行 sing-box 全量卸载清理。"
-  pause
-}
-
-register_shortcut() {
-  install -d -m 755 "$(dirname "$SCRIPT_COPY")"
-  if [[ "$0" != "$SHORTCUT" && "$0" != "$SCRIPT_COPY" && -f "$0" && -r "$0" ]]; then
-    install -m 700 "$0" "$SCRIPT_COPY"
-  elif [[ ! -s "$SCRIPT_COPY" ]]; then
-    warn "当前不是可复制的本地脚本文件；请先下载 Any.sh，再运行 bash Any.sh。"
-    return 1
-  fi
-  if [[ -e "$SHORTCUT" && ! -f "$SHORTCUT" ]]; then
-    warn "$SHORTCUT 已存在且不是普通文件，跳过快捷命令注册。"; return 1
-  fi
-  if [[ -f "$SHORTCUT" ]] && ! grep -q 'ANYSH_MANAGED_SHORTCUT' "$SHORTCUT"; then
-    warn "$SHORTCUT 已被其他程序占用，拒绝覆盖。"; return 1
-  fi
-  cat > "$SHORTCUT" <<'EOF'
+    local target_paths=("/usr/local/bin/any" "/usr/bin/any")
+    for path in "${target_paths[@]}"; do
+        mkdir -p "$(dirname "$path")"
+        rm -rf "$path" 2>/dev/null || true
+        cat << 'EOF' > "$path"
 #!/usr/bin/env bash
-# ANYSH_MANAGED_SHORTCUT_V2
-exec bash /usr/local/lib/any-manager/Any.sh "$@"
+if [[ -f /root/any.sh ]]; then
+    exec bash /root/any.sh "$@"
+else
+    echo "未找到本地脚本 /root/any.sh，请重新下载运行。"
+    exit 1
+fi
 EOF
-  chmod 755 "$SHORTCUT"
+        chmod +x "$path" 2>/dev/null || true
+    done
 }
-main() {
-  require_root
-  register_shortcut || true
-  while true; do
-    clear 2>/dev/null || true
-    echo "=============================================="
-    echo "      sing-box AnyTLS-Reality / AnyTLS 管理器"
-    echo "                    V${VERSION}"
-    echo "=============================================="
-    if systemctl is-active --quiet "$SERVICE"; then ok "sing-box：运行中"; else warn "sing-box：未运行或未安装"; fi
-    echo "1. 安装 / 重构节点"
-    echo "2. 服务管理"
-    echo "3. 查看节点链接"
-    echo "4. 查看运行状态"
-    echo "5. 实时日志（Ctrl+C 返回）"
-    echo "6. 卸载本管理器配置（保留其他入站和核心）"
-    echo "7. 完全卸载 sing-box（危险操作）"
-    echo "0. 退出"
-    read -r -p "请选择 [0-7]: " choice || exit 0
-    case "$choice" in
-      1) deploy ;;
-      2) service_menu ;;
-      3) show_links ;;
-      4) status ;;
-      5) logs || true ;;
-      6) uninstall ;;
-      7) full_uninstall ;;
-      0) exit 0 ;;
-      *) warn "无效选项"; sleep 1 ;;
+
+# 校验端口格式
+validate_port() {
+    local port="$1"
+    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
+}
+
+# 检测端口占用 (兼容 BusyBox ss / netstat / lsof)
+check_and_print_port_status() {
+    local port="$1"
+    local is_busy=0
+
+    if command -v ss &>/dev/null; then
+        ss -tuln 2>/dev/null | grep -qE ":${port}([[:space:]]|$)" && is_busy=1
+    elif command -v netstat &>/dev/null; then
+        netstat -tuln 2>/dev/null | grep -qE ":${port}([[:space:]]|$)" && is_busy=1
+    elif command -v lsof &>/dev/null; then
+        lsof -i:"${port}" &>/dev/null && is_busy=1
+    fi
+
+    if [[ $is_busy -eq 1 ]]; then
+        log_warn "检测到端口 ${port} ${RED}已被占用${NC}！"
+        return 1
+    else
+        log_success "检测到端口 ${port} ${GREEN}未被占用${NC}，可以使用。"
+        return 0
+    fi
+}
+
+# 获取公网 IP
+get_public_ip() {
+    local ip
+    ip=$(curl -s4 --connect-timeout 5 https://api.ipify.org 2>/dev/null || true)
+    if [[ -z "$ip" ]]; then
+        ip=$(curl -s6 --connect-timeout 5 https://api64.ipify.org 2>/dev/null || true)
+    fi
+    echo "${ip:-127.0.0.1}"
+}
+
+# 自动放行防火墙端口 (兼容 Alpine iptables / UFW / Firewalld)
+open_firewall_port() {
+    local port="$1"
+    log_info "正在检查并放行防火墙端口 ${port}..."
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
+        ufw allow "${port}/tcp" >/dev/null 2>&1 || true
+        log_success "UFW 防火墙端口 ${port} 放行成功！"
+    elif command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
+        firewall-cmd --zone=public --add-port="${port}/tcp" --permanent >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+        log_success "Firewalld 防火墙端口 ${port} 放行成功！"
+    elif command -v iptables &>/dev/null; then
+        if ! iptables -C INPUT -p tcp --dport "${port}" -j ACCEPT >/dev/null 2>&1; then
+            iptables -I INPUT -p tcp --dport "${port}" -j ACCEPT >/dev/null 2>&1 || true
+            if is_alpine && [[ -x /etc/init.d/iptables ]]; then
+                /etc/init.d/iptables save >/dev/null 2>&1 || true
+            fi
+        fi
+        log_success "iptables 端口 ${port} 已放行！"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# 服务控制抽象层 (兼容 OpenRC 与 Systemd)
+# ------------------------------------------------------------------------------
+svc_is_active() {
+    if is_alpine; then
+        rc-service "$SERVICE_NAME" status >/dev/null 2>&1 || pidof sing-box >/dev/null 2>&1
+    else
+        systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null
+    fi
+}
+
+svc_start() {
+    if is_alpine; then
+        rc-service "$SERVICE_NAME" start
+    else
+        systemctl start "$SERVICE_NAME"
+    fi
+}
+
+svc_stop() {
+    if is_alpine; then
+        rc-service "$SERVICE_NAME" stop
+    else
+        systemctl stop "$SERVICE_NAME"
+    fi
+}
+
+svc_restart() {
+    if is_alpine; then
+        rc-update add "$SERVICE_NAME" default >/dev/null 2>&1 || true
+        rc-service "$SERVICE_NAME" restart
+    else
+        systemctl daemon-reload
+        systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
+        systemctl restart "$SERVICE_NAME"
+    fi
+}
+
+setup_alpine_openrc() {
+    cat << 'EOF' > /etc/init.d/sing-box
+#!/sbin/openrc-run
+
+name="sing-box"
+description="sing-box proxy service"
+command="/usr/bin/sing-box"
+command_args="run -c /etc/sing-box/config.json"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/sing-box.log"
+error_log="/var/log/sing-box.log"
+
+depend() {
+    need net
+    after firewall
+}
+EOF
+    chmod +x /etc/init.d/sing-box
+    rc-update add "$SERVICE_NAME" default >/dev/null 2>&1 || true
+}
+
+# 打印当前系统的安装与运行状态卡片
+print_system_status() {
+    echo -e "${CYAN}-----------------------------------------------------${NC}"
+    if [[ -f "$CONFIG_PATH" && -f "$INFO_PATH" ]]; then
+        local installed_proto=""
+        if jq -e .reality "$INFO_PATH" >/dev/null 2>&1 && jq -e .anytls "$INFO_PATH" >/dev/null 2>&1; then
+            installed_proto="双协议 (AnyReality + AnyTLS)"
+        elif jq -e .reality "$INFO_PATH" >/dev/null 2>&1; then
+            installed_proto="AnyReality"
+        elif jq -e .anytls "$INFO_PATH" >/dev/null 2>&1; then
+            installed_proto="AnyTLS"
+        else
+            installed_proto="未知配置"
+        fi
+
+        if svc_is_active; then
+            local pid
+            pid=$(pidof sing-box 2>/dev/null | awk '{print $1}' || echo "未知")
+            echo -e " 服务状态: ${GREEN}${BOLD}● 已安装并正常运行中${NC} (PID: ${pid})"
+            echo -e " 已配置项: ${CYAN}${installed_proto}${NC}"
+        else
+            echo -e " 服务状态: ${YELLOW}${BOLD}● 已安装但未运行 (已停止)${NC}"
+            echo -e " 已配置项: ${CYAN}${installed_proto}${NC}"
+        fi
+    else
+        echo -e " 服务状态: ${RED}${BOLD}○ 未安装 / 未配置${NC}"
+    fi
+    echo -e "${CYAN}-----------------------------------------------------${NC}"
+}
+
+# ------------------------------------------------------------------------------
+# 依赖与 Sing-Box 内核安装 (Alpine 专用静态包 + 常规系统官方源)
+# ------------------------------------------------------------------------------
+install_singbox_alpine() {
+    local arch sb_arch latest_tag download_url tmp_dir
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64|amd64) sb_arch="amd64" ;;
+        aarch64|arm64) sb_arch="arm64" ;;
+        armv7l) sb_arch="armv7" ;;
+        *) log_error "不支持的 CPU 架构: $arch"; return 1 ;;
     esac
-  done
+
+    log_info "正在从 GitHub 获取最新 Sing-Box 官方正式版版本号..."
+    latest_tag=$(curl -fsSL "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | jq -r '.tag_name' | sed 's/^v//')
+    if [[ -z "$latest_tag" || "$latest_tag" == "null" ]]; then
+        log_error "无法获取 Sing-Box 最新版本号，请检查服务器网络（或 GitHub API 限制）。"
+        return 1
+    fi
+
+    download_url="https://github.com/SagerNet/sing-box/releases/download/v${latest_tag}/sing-box-${latest_tag}-linux-${sb_arch}.tar.gz"
+    tmp_dir=$(mktemp -d)
+    log_info "正在下载 Sing-Box v${latest_tag} (${sb_arch})..."
+
+    if curl -fsSL "$download_url" -o "${tmp_dir}/sb.tar.gz"; then
+        tar -xzf "${tmp_dir}/sb.tar.gz" -C "$tmp_dir"
+        install -m 755 "${tmp_dir}/sing-box-${latest_tag}-linux-${sb_arch}/sing-box" /usr/bin/sing-box
+        rm -rf "$tmp_dir"
+        setup_alpine_openrc
+        log_success "Sing-Box v${latest_tag} 安装及 OpenRC 服务注册成功！"
+    else
+        rm -rf "$tmp_dir"
+        log_error "下载 Sing-Box 失败，请检查网络连接。"
+        return 1
+    fi
 }
-main "$@"
+
+install_dependencies() {
+    log_info "检查并安装必要依赖组件..."
+    rm -f /etc/sing-box/client_info.json
+
+    if is_alpine; then
+        apk update -q
+        apk add --no-cache -q bash curl jq openssl iproute2 tar ca-certificates openrc
+        install_singbox_alpine || { pause; return 1; }
+    else
+        if command -v apt-get &>/dev/null; then
+            apt-get update -y -qq
+            apt-get install -y -qq curl jq iproute2 openssl lsof ca-certificates
+        elif command -v dnf &>/dev/null; then
+            dnf install -y -q curl jq iproute openssl lsof ca-certificates
+        elif command -v yum &>/dev/null; then
+            yum install -y -q curl jq iproute openssl lsof ca-certificates
+        fi
+
+        log_info "正在安装/更新 Sing-Box (官方正式版内核)..."
+        if curl -fsSL https://sing-box.app/install.sh | sh; then
+            log_success "Sing-Box 核心组件安装/更新完毕！"
+        else
+            log_error "Sing-Box 安装失败，请检查服务器网络。"
+            pause
+            return 1
+        fi
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# 证书生成模块 (POSIX 兼容写法)
+# ------------------------------------------------------------------------------
+generate_cert() {
+    local sni="$1"
+    mkdir -p "$TLS_DIR"
+    log_info "正在为域名 [ ${sni} ] 生成自签名 ECC 证书..."
+
+    openssl ecparam -genkey -name prime256v1 -out "$TLS_DIR/server.key" >/dev/null 2>&1
+    openssl req -new -x509 -days 3650 \
+        -key "$TLS_DIR/server.key" \
+        -out "$TLS_DIR/server.crt" \
+        -subj "/CN=${sni}" >/dev/null 2>&1
+
+    if [[ -f "$TLS_DIR/server.key" && -f "$TLS_DIR/server.crt" ]]; then
+        chmod 600 "$TLS_DIR/server.key"
+        chmod 644 "$TLS_DIR/server.crt"
+        log_success "TLS 证书及私钥生成成功！"
+    else
+        log_error "证书生成失败！"
+        pause
+        exit 1
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# 安装与节点配置
+# ------------------------------------------------------------------------------
+install_node() {
+    clear
+    echo -e "${CYAN}=====================================================${NC}"
+    echo -e "${BOLD}             配置 Sing-Box 节点协议                 ${NC}"
+    echo -e "${CYAN}=====================================================${NC}"
+    echo -e " 1. 单独部署 ${BOLD}AnyReality${NC}"
+    echo -e " 2. 单独部署 ${BOLD}AnyTLS${NC}"
+    echo -e " 3. 双协议同时部署 (${BOLD}AnyReality + AnyTLS${NC})"
+    echo -e " 0. 返回主菜单"
+    echo -e "${CYAN}-----------------------------------------------------${NC}"
+
+    local mode
+    read -rp " 请选择运行模式 [0-3]: " mode
+    case "$mode" in
+        1|2|3) ;;
+        0) return ;;
+        *) log_error "无效选项，请输入 0-3 中的数字。"; sleep 1; return ;;
+    esac
+
+    clear
+    install_dependencies || return
+
+    local inbounds_json="[]"
+    local info_json="{}"
+    local r_port="" t_port=""
+
+    # 1) 配置 AnyReality
+    if [[ "$mode" == "1" || "$mode" == "3" ]]; then
+        echo -e "\n${YELLOW}>>>> 开始配置 AnyReality <<<<${NC}"
+
+        while :; do
+            read -rp " 请输入端口 [默认: 1443]: " r_port
+            r_port=${r_port:-1443}
+            if ! validate_port "$r_port"; then
+                log_warn "端口号不合法，请输入 1-65535 之间的整数。"
+                continue
+            fi
+            if ! check_and_print_port_status "$r_port"; then
+                continue
+            fi
+            break
+        done
+
+        local r_pwd r_sni
+        read -rp " 请输入密码 [默认: 自动生成]: " r_pwd
+        r_pwd=${r_pwd:-$(openssl rand -hex 16)}
+
+        read -rp " 请输入 Reality 伪装域名 [默认: www.microsoft.com]: " r_sni
+        r_sni=${r_sni:-www.microsoft.com}
+
+        log_info "正在生成 REALITY 密钥对..."
+        local keypair
+        keypair=$(/usr/bin/sing-box generate reality-keypair)
+        local priv_key pub_key short_id
+        priv_key=$(echo "$keypair" | awk '/PrivateKey/ {print $2}')
+        pub_key=$(echo "$keypair" | awk '/PublicKey/ {print $2}')
+        short_id=$(openssl rand -hex 8)
+
+        local r_inbound
+        r_inbound=$(jq -n \
+            --arg p "$r_port" \
+            --arg w "$r_pwd" \
+            --arg s "$r_sni" \
+            --arg k "$priv_key" \
+            --arg id "$short_id" \
+            '{
+                type: "anytls",
+                listen: "::",
+                listen_port: ($p | tonumber),
+                users: [{ name: "user", password: $w }],
+                padding_scheme: ["stop=8","0=30-30","1=100-400","2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000","3=9-9,500-1000","4=500-1000","5=500-1000","6=500-1000","7=500-1000"],
+                tls: {
+                    enabled: true,
+                    server_name: $s,
+                    reality: {
+                        enabled: true,
+                        handshake: { server: $s, server_port: 443 },
+                        private_key: $k,
+                        short_id: [$id]
+                    }
+                }
+            }')
+
+        inbounds_json=$(echo "$inbounds_json" | jq --argjson new "$r_inbound" '. + [$new]')
+        info_json=$(echo "$info_json" | jq --arg p "$r_port" --arg w "$r_pwd" --arg s "$r_sni" --arg pk "$pub_key" --arg id "$short_id" \
+            '. + {reality: {port: $p, pwd: $w, sni: $s, pk: $pk, id: $id}}')
+
+        open_firewall_port "$r_port"
+        log_success "AnyReality 参数配置完成！"
+    fi
+
+    # 2) 配置 AnyTLS
+    if [[ "$mode" == "2" || "$mode" == "3" ]]; then
+        echo -e "\n${YELLOW}>>>> 开始配置 AnyTLS <<<<${NC}"
+
+        while :; do
+            read -rp " 请输入端口 [默认: 2026]: " t_port
+            t_port=${t_port:-2026}
+            if ! validate_port "$t_port"; then
+                log_warn "端口号不合法，请输入 1-65535 之间的整数。"
+                continue
+            fi
+            if [[ "$mode" == "3" && "$t_port" == "$r_port" ]]; then
+                log_warn "端口不能与 AnyReality 端口重复！"
+                continue
+            fi
+            if ! check_and_print_port_status "$t_port"; then
+                continue
+            fi
+            break
+        done
+
+        local t_pwd t_sni
+        read -rp " 请输入密码 [默认: 自动生成]: " t_pwd
+        t_pwd=${t_pwd:-$(openssl rand -hex 16)}
+
+        read -rp " 请输入 TLS 伪装域名 [默认: www.microsoft.com]: " t_sni
+        t_sni=${t_sni:-www.microsoft.com}
+
+        generate_cert "$t_sni"
+
+        local t_inbound
+        t_inbound=$(jq -n \
+            --arg p "$t_port" \
+            --arg w "$t_pwd" \
+            '{
+                type: "anytls",
+                listen: "::",
+                listen_port: ($p | tonumber),
+                users: [{ password: $w }],
+                padding_scheme: ["stop=8","0=30-80","1=100-400","2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000","3=9-9,500-1000","4=500-1000","5=500-1000","6=500-1000","7=500-1000"],
+                tls: {
+                    enabled: true,
+                    certificate_path: "/root/AnyTLS/tls/server.crt",
+                    key_path: "/root/AnyTLS/tls/server.key"
+                }
+            }')
+
+        inbounds_json=$(echo "$inbounds_json" | jq --argjson new "$t_inbound" '. + [$new]')
+        info_json=$(echo "$info_json" | jq --arg p "$t_port" --arg w "$t_pwd" --arg s "$t_sni" \
+            '. + {anytls: {port: $p, pwd: $w, sni: $s}}')
+
+        open_firewall_port "$t_port"
+        log_success "AnyTLS 参数配置完成！"
+    fi
+
+    # 保存配置并补充 outbounds
+    echo "$info_json" > "$INFO_PATH"
+    chmod 600 "$INFO_PATH"
+    mkdir -p "$(dirname "$CONFIG_PATH")"
+    jq -n --argjson ib "$inbounds_json" '{
+        log: {level: "info", timestamp: true},
+        inbounds: $ib,
+        outbounds: [{type: "direct", tag: "direct"}]
+    }' > "$CONFIG_PATH"
+    chmod 600 "$CONFIG_PATH"
+
+    if ! /usr/bin/sing-box check -c "$CONFIG_PATH"; then
+        log_error "配置文件校验未通过，请检查参数。"
+        pause
+        return 1
+    fi
+
+    log_info "正在启动与重载 Sing-Box 服务..."
+    svc_restart
+
+    log_success "恭喜！Sing-Box 节点配置与部署完全成功！"
+    pause
+    show_links
+}
+
+# ------------------------------------------------------------------------------
+# 节点链接展示
+# ------------------------------------------------------------------------------
+show_links() {
+    clear
+    if [[ ! -f "$INFO_PATH" ]]; then
+        log_warn "未找到节点配置元数据，请先进行部署。"
+        pause
+        return
+    fi
+
+    local ip
+    ip=$(get_public_ip)
+
+    echo -e "${CYAN}=====================================================${NC}"
+    echo -e "${BOLD}               已生成的节点连接信息                ${NC}"
+    echo -e "${CYAN}=====================================================${NC}\n"
+
+    if jq -e .reality "$INFO_PATH" >/dev/null 2>&1; then
+        local p w s k d
+        p=$(jq -r .reality.port "$INFO_PATH")
+        w=$(jq -r .reality.pwd "$INFO_PATH")
+        s=$(jq -r .reality.sni "$INFO_PATH")
+        k=$(jq -r .reality.pk "$INFO_PATH")
+        d=$(jq -r .reality.id "$INFO_PATH")
+
+        echo -e "${GREEN}[ AnyReality 节点链接 ]: ${NC}"
+        echo -e "${YELLOW}anytls://${w}@${ip}:${p}/?sni=${s}&fp=chrome&pbk=${k}&sid=${d}#AnyReality_${ip}${NC}\n"
+
+        echo -e "${GREEN}[ Sing-Box 客户端 outbound JSON ]: ${NC}"
+        jq -n --arg server "$ip" --argjson port "$p" --arg password "$w" --arg sni "$s" --arg pk "$k" --arg sid "$d" '{
+            type: "anytls",
+            tag: "anytls-reality-out",
+            server: $server,
+            server_port: $port,
+            password: $password,
+            tls: {
+                enabled: true,
+                server_name: $sni,
+                utls: { enabled: true, fingerprint: "chrome" },
+                reality: { enabled: true, public_key: $pk, short_id: $sid }
+            }
+        }'
+        echo
+    fi
+
+    if jq -e .anytls "$INFO_PATH" >/dev/null 2>&1; then
+        local p w s
+        p=$(jq -r .anytls.port "$INFO_PATH")
+        w=$(jq -r .anytls.pwd "$INFO_PATH")
+        s=$(jq -r .anytls.sni "$INFO_PATH")
+
+        echo -e "${GREEN}[ AnyTLS 节点链接 ]: ${NC}"
+        echo -e "${YELLOW}anytls://${w}@${ip}:${p}/?sni=${s}&insecure=1#AnyTLS_${ip}${NC}\n"
+    fi
+    echo -e "${CYAN}=====================================================${NC}"
+    pause
+}
+
+# ------------------------------------------------------------------------------
+# 服务管理与状态模块
+# ------------------------------------------------------------------------------
+manage_service() {
+    clear
+    echo -e "${CYAN}=====================================================${NC}"
+    echo -e "${BOLD}                   服务控制面板                     ${NC}"
+    echo -e "${CYAN}=====================================================${NC}"
+    echo -e " 1. 启动服务"
+    echo -e " 2. 停止服务"
+    echo -e " 3. 重启服务"
+    echo -e " 0. 返回上一菜单"
+    echo -e "${CYAN}-----------------------------------------------------${NC}"
+
+    read -rp " 请选择操作 [0-3]: " act
+    case "$act" in
+        1) svc_start && log_success "Sing-Box 服务启动成功！" ;;
+        2) svc_stop && log_success "Sing-Box 服务已停止！" ;;
+        3) svc_restart && log_success "Sing-Box 服务重启成功！" ;;
+        0) return ;;
+        *) log_error "无效选项"; sleep 1; return ;;
+    esac
+    pause
+}
+
+show_status() {
+    clear
+    echo -e "${CYAN}=====================================================${NC}"
+    echo -e "${BOLD}               Sing-Box 服务运行状态                ${NC}"
+    echo -e "${CYAN}=====================================================${NC}\n"
+    if is_alpine; then
+        rc-service "$SERVICE_NAME" status || true
+        ps -ef | grep "[s]ing-box" || true
+    else
+        systemctl status "$SERVICE_NAME" --no-pager || true
+    fi
+    echo -e "\n${CYAN}=====================================================${NC}"
+    pause
+}
+
+show_logs() {
+    clear
+    echo -e "${CYAN}=====================================================${NC}"
+    echo -e "${BOLD}      正在查看日志 (退出实时日志按 Ctrl+C)          ${NC}"
+    echo -e "${CYAN}=====================================================${NC}\n"
+    if is_alpine; then
+        if [[ -f "$LOG_FILE" ]]; then
+            tail -n 50 -f "$LOG_FILE" || true
+        else
+            log_warn "日志文件 $LOG_FILE 尚未生成。"
+        fi
+    else
+        journalctl -u "$SERVICE_NAME" -e -f -n 50 || true
+    fi
+    pause
+}
+
+uninstall_all() {
+    clear
+    echo -e "${RED}=====================================================${NC}"
+    echo -e "${BOLD}                   卸载 Sing-Box                    ${NC}"
+    echo -e "${RED}=====================================================${NC}"
+    read -rp " 确定要彻底卸载 Sing-Box 及其所有配置文件吗？[y/N]: " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        log_info "正在清理并卸载..."
+        if is_alpine; then
+            rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
+            rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true
+            rm -f /etc/init.d/"$SERVICE_NAME" "$LOG_FILE"
+        else
+            systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+            systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+            rm -f /etc/systemd/system/"$SERVICE_NAME".service
+            systemctl daemon-reload
+        fi
+
+        rm -f /usr/bin/"$SERVICE_NAME" /usr/local/bin/"$SERVICE_NAME" /usr/local/bin/any /usr/bin/any "$LOCAL_SCRIPT_PATH"
+        rm -rf /etc/"$SERVICE_NAME" "$INFO_PATH" /root/AnyTLS
+
+        log_success "Sing-Box 及脚本组件已彻底清理卸载完成！"
+    else
+        log_info "已取消卸载。"
+    fi
+    pause
+}
+
+# ------------------------------------------------------------------------------
+# 主菜单循环
+# ------------------------------------------------------------------------------
+main_menu() {
+    check_root
+    force_register_shortcut
+
+    while :; do
+        clear
+        echo -e "${CYAN}=====================================================${NC}"
+        echo -e "${BOLD}       Sing-Box (AnyTLS / AnyReality) 管理脚本       ${NC}"
+        echo -e "         快捷指令: 在终端输入 ${YELLOW}${BOLD}any${NC} 即可快速打开"
+
+        print_system_status
+
+        echo -e " ${GREEN}1.${NC} 安装 / 重构节点"
+        echo -e " ${GREEN}2.${NC} 服务管理 (启动/停止/重启)"
+        echo -e " ${GREEN}3.${NC} 查看节点链接"
+        echo -e " ${GREEN}4.${NC} 查看运行状态"
+        echo -e " ${GREEN}5.${NC} 查看实时日志"
+        echo -e " ${RED}6.${NC} 卸载 Sing-Box"
+        echo -e " ${YELLOW}0.${NC} 退出脚本"
+        echo -e "${CYAN}=====================================================${NC}"
+
+        read -rp " 请输入选项 [0-6]: " opt
+        case "$opt" in
+            1) install_node ;;
+            2) manage_service ;;
+            3) show_links ;;
+            4) show_status ;;
+            5) show_logs ;;
+            6) uninstall_all ;;
+            0)
+                clear
+                echo -e "${GREEN}感谢使用！随时输入 'any' 唤醒本脚本。${NC}"
+                exit 0
+                ;;
+            *)
+                log_error "请输入正确的选项 [0-6]"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+main_menu
