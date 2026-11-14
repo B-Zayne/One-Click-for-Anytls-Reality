@@ -102,7 +102,7 @@ check_and_print_port_status() {
     fi
 }
 
-# 获取公网 IP
+# 获取公网 IPv4（如无纯 IPv4 则回退 IPv6）
 get_public_ip() {
     local ip
     ip=$(curl -s4 --connect-timeout 5 https://api.ipify.org 2>/dev/null || true)
@@ -342,14 +342,14 @@ install_node() {
 
     local inbounds_json="[]"
     local info_json="{}"
-    local r_port="" t_port=""
+    local r_port="" r_ext_port="" t_port="" t_ext_port=""
 
     # 1) 配置 AnyReality
     if [[ "$mode" == "1" || "$mode" == "3" ]]; then
         echo -e "\n${YELLOW}>>>> 开始配置 AnyReality <<<<${NC}"
 
         while :; do
-            read -rp " 请输入端口 [默认: 1443]: " r_port
+            read -rp " 请输入本机监听端口 [默认: 1443]: " r_port
             r_port=${r_port:-1443}
             if ! validate_port "$r_port"; then
                 log_warn "端口号不合法，请输入 1-65535 之间的整数。"
@@ -361,12 +361,22 @@ install_node() {
             break
         done
 
+        while :; do
+            read -rp " 请输入外部映射端口 (NAT 机器若内外端口不同请填写，独立 VPS 直接回车) [默认: ${r_port}]: " r_ext_port
+            r_ext_port=${r_ext_port:-$r_port}
+            if ! validate_port "$r_ext_port"; then
+                log_warn "外部端口号不合法，请输入 1-65535 之间的整数。"
+                continue
+            fi
+            break
+        done
+
         local r_pwd r_sni
         read -rp " 请输入密码 [默认: 自动生成]: " r_pwd
         r_pwd=${r_pwd:-$(openssl rand -hex 16)}
 
-        read -rp " 请输入 Reality 伪装域名 [默认: www.microsoft.com]: " r_sni
-        r_sni=${r_sni:-www.microsoft.com}
+        read -rp " 请输入 Reality 伪装域名 [默认: genshin.hoyoverse.com]: " r_sni
+        r_sni=${r_sni:-genshin.hoyoverse.com}
 
         log_info "正在生成 REALITY 密钥对..."
         local keypair
@@ -402,8 +412,8 @@ install_node() {
             }')
 
         inbounds_json=$(echo "$inbounds_json" | jq --argjson new "$r_inbound" '. + [$new]')
-        info_json=$(echo "$info_json" | jq --arg p "$r_port" --arg w "$r_pwd" --arg s "$r_sni" --arg pk "$pub_key" --arg id "$short_id" \
-            '. + {reality: {port: $p, pwd: $w, sni: $s, pk: $pk, id: $id}}')
+        info_json=$(echo "$info_json" | jq --arg p "$r_port" --arg ep "$r_ext_port" --arg w "$r_pwd" --arg s "$r_sni" --arg pk "$pub_key" --arg id "$short_id" \
+            '. + {reality: {port: $p, ext_port: $ep, pwd: $w, sni: $s, pk: $pk, id: $id}}')
 
         open_firewall_port "$r_port"
         log_success "AnyReality 参数配置完成！"
@@ -414,7 +424,7 @@ install_node() {
         echo -e "\n${YELLOW}>>>> 开始配置 AnyTLS <<<<${NC}"
 
         while :; do
-            read -rp " 请输入端口 [默认: 2026]: " t_port
+            read -rp " 请输入本机监听端口 [默认: 2026]: " t_port
             t_port=${t_port:-2026}
             if ! validate_port "$t_port"; then
                 log_warn "端口号不合法，请输入 1-65535 之间的整数。"
@@ -430,12 +440,22 @@ install_node() {
             break
         done
 
+        while :; do
+            read -rp " 请输入外部映射端口 (NAT 机器若内外端口不同请填写，独立 VPS 直接回车) [默认: ${t_port}]: " t_ext_port
+            t_ext_port=${t_ext_port:-$t_port}
+            if ! validate_port "$t_ext_port"; then
+                log_warn "外部端口号不合法，请输入 1-65535 之间的整数。"
+                continue
+            fi
+            break
+        done
+
         local t_pwd t_sni
         read -rp " 请输入密码 [默认: 自动生成]: " t_pwd
         t_pwd=${t_pwd:-$(openssl rand -hex 16)}
 
-        read -rp " 请输入 TLS 伪装域名 [默认: www.microsoft.com]: " t_sni
-        t_sni=${t_sni:-www.microsoft.com}
+        read -rp " 请输入 TLS 伪装域名 [默认: genshin.hoyoverse.com]: " t_sni
+        t_sni=${t_sni:-genshin.hoyoverse.com}
 
         generate_cert "$t_sni"
 
@@ -447,7 +467,7 @@ install_node() {
                 type: "anytls",
                 listen: "::",
                 listen_port: ($p | tonumber),
-                users: [{ password: $w }],
+                users: [{ name: "user", password: $w }],
                 padding_scheme: ["stop=8","0=30-80","1=100-400","2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000","3=9-9,500-1000","4=500-1000","5=500-1000","6=500-1000","7=500-1000"],
                 tls: {
                     enabled: true,
@@ -457,21 +477,33 @@ install_node() {
             }')
 
         inbounds_json=$(echo "$inbounds_json" | jq --argjson new "$t_inbound" '. + [$new]')
-        info_json=$(echo "$info_json" | jq --arg p "$t_port" --arg w "$t_pwd" --arg s "$t_sni" \
-            '. + {anytls: {port: $p, pwd: $w, sni: $s}}')
+        info_json=$(echo "$info_json" | jq --arg p "$t_port" --arg ep "$t_ext_port" --arg w "$t_pwd" --arg s "$t_sni" \
+            '. + {anytls: {port: $p, ext_port: $ep, pwd: $w, sni: $s}}')
 
         open_firewall_port "$t_port"
         log_success "AnyTLS 参数配置完成！"
     fi
 
-    # 保存配置并补充 outbounds
+    # 保存配置（强制锁定 IPv4 出站与 DNS 解析，规避机房 IPv6 导致的 YouTube 超长广告风控）
     echo "$info_json" > "$INFO_PATH"
     chmod 600 "$INFO_PATH"
     mkdir -p "$(dirname "$CONFIG_PATH")"
     jq -n --argjson ib "$inbounds_json" '{
         log: {level: "info", timestamp: true},
+        dns: {
+            servers: [
+                { tag: "google", address: "https://8.8.8.8/dns-query", strategy: "ipv4_only" }
+            ],
+            strategy: "ipv4_only"
+        },
         inbounds: $ib,
-        outbounds: [{type: "direct", tag: "direct"}]
+        outbounds: [
+            {
+                type: "direct",
+                tag: "direct",
+                domain_strategy: "ipv4_only"
+            }
+        ]
     }' > "$CONFIG_PATH"
     chmod 600 "$CONFIG_PATH"
 
@@ -508,18 +540,22 @@ show_links() {
     echo -e "${CYAN}=====================================================${NC}\n"
 
     if jq -e .reality "$INFO_PATH" >/dev/null 2>&1; then
-        local p w s k d
+        local p ep w s k d
         p=$(jq -r .reality.port "$INFO_PATH")
+        ep=$(jq -r '.reality.ext_port // .reality.port' "$INFO_PATH")
         w=$(jq -r .reality.pwd "$INFO_PATH")
         s=$(jq -r .reality.sni "$INFO_PATH")
         k=$(jq -r .reality.pk "$INFO_PATH")
         d=$(jq -r .reality.id "$INFO_PATH")
 
+        if [[ "$p" != "$ep" ]]; then
+            echo -e "${BLUE}[提示] 内网监听端口: ${p} -> 外部连接端口: ${ep}${NC}"
+        fi
         echo -e "${GREEN}[ AnyReality 节点链接 ]: ${NC}"
-        echo -e "${YELLOW}anytls://${w}@${ip}:${p}/?sni=${s}&fp=chrome&pbk=${k}&sid=${d}#AnyReality_${ip}${NC}\n"
+        echo -e "${YELLOW}anytls://${w}@${ip}:${ep}/?sni=${s}&fp=chrome&pbk=${k}&sid=${d}#AnyReality_${ip}${NC}\n"
 
         echo -e "${GREEN}[ Sing-Box 客户端 outbound JSON ]: ${NC}"
-        jq -n --arg server "$ip" --argjson port "$p" --arg password "$w" --arg sni "$s" --arg pk "$k" --arg sid "$d" '{
+        jq -n --arg server "$ip" --argjson port "$ep" --arg password "$w" --arg sni "$s" --arg pk "$k" --arg sid "$d" '{
             type: "anytls",
             tag: "anytls-reality-out",
             server: $server,
@@ -536,13 +572,17 @@ show_links() {
     fi
 
     if jq -e .anytls "$INFO_PATH" >/dev/null 2>&1; then
-        local p w s
+        local p ep w s
         p=$(jq -r .anytls.port "$INFO_PATH")
+        ep=$(jq -r '.anytls.ext_port // .anytls.port' "$INFO_PATH")
         w=$(jq -r .anytls.pwd "$INFO_PATH")
         s=$(jq -r .anytls.sni "$INFO_PATH")
 
+        if [[ "$p" != "$ep" ]]; then
+            echo -e "${BLUE}[提示] 内网监听端口: ${p} -> 外部连接端口: ${ep}${NC}"
+        fi
         echo -e "${GREEN}[ AnyTLS 节点链接 ]: ${NC}"
-        echo -e "${YELLOW}anytls://${w}@${ip}:${p}/?sni=${s}&insecure=1#AnyTLS_${ip}${NC}\n"
+        echo -e "${YELLOW}anytls://${w}@${ip}:${ep}/?sni=${s}&insecure=1#AnyTLS_${ip}${NC}\n"
     fi
     echo -e "${CYAN}=====================================================${NC}"
     pause
