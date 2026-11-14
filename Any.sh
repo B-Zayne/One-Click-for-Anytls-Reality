@@ -11,7 +11,7 @@ readonly TLS_DIR="/root/AnyTLS/tls"
 readonly LOG_FILE="/var/log/sing-box.log"
 readonly SERVICE_NAME="sing-box"
 readonly LOCAL_SCRIPT_PATH="/root/any.sh"
-readonly REPO_RAW_URL="https://raw.githubusercontent.com/B-Zayne/One-Click-for-Anytls-Reality/refs/heads/main/any.sh"
+readonly REPO_RAW_URL="https://raw.githubusercontent.com/B-Zayne/One-Click-for-Anytls-Reality/refs/heads/main/Any.sh"
 
 # 颜色与样式
 readonly RED='\033[0;31m'
