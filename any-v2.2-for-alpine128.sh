@@ -48,6 +48,17 @@ check_root() {
     fi
 }
 
+# 兼容性杀进程辅助函数 (不依赖 killall / pkill / xargs -r)
+kill_singbox_procs() {
+    local pids
+    pids=$(pidof sing-box 2>/dev/null || true)
+    if [[ -n "$pids" ]]; then
+        for p in $pids; do
+            kill -9 "$p" 2>/dev/null || true
+        done
+    fi
+}
+
 # ------------------------------------------------------------------------------
 # 全局快捷指令注册 ('any' 命令)
 # ------------------------------------------------------------------------------
@@ -100,6 +111,13 @@ check_and_print_port_status() {
         log_success "检测到端口 ${port} ${GREEN}未被占用${NC}，可以使用。"
         return 0
     fi
+}
+
+# 检测本机是否具备有效公网 IPv4 出口
+has_public_ipv4() {
+    local ip4
+    ip4=$(curl -s4 --connect-timeout 4 https://api.ipify.org 2>/dev/null || true)
+    [[ -n "$ip4" && "$ip4" != *:* ]]
 }
 
 # 获取公网 IP
@@ -158,7 +176,7 @@ svc_start() {
 svc_stop() {
     if is_alpine; then
         rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
-        killall sing-box >/dev/null 2>&1 || true
+        kill_singbox_procs
     else
         systemctl stop "$SERVICE_NAME"
     fi
@@ -179,7 +197,7 @@ svc_restart() {
     if is_alpine; then
         rc-update add "$SERVICE_NAME" default >/dev/null 2>&1 || true
         if ! rc-service "$SERVICE_NAME" restart >/dev/null 2>&1; then
-            killall sing-box >/dev/null 2>&1 || true
+            kill_singbox_procs
             GOGC=50 GOMEMLIMIT=64MiB nohup /usr/bin/sing-box run -c "$CONFIG_PATH" >/dev/null 2>"$LOG_FILE" &
         fi
     else
@@ -273,10 +291,12 @@ install_singbox_alpine() {
 
     download_url="https://github.com/SagerNet/sing-box/releases/download/v${latest_tag}/sing-box-${latest_tag}-linux-${sb_arch}.tar.gz"
     rm -rf "$tmp_dir" && mkdir -p "$tmp_dir"
-    log_info "正在下载并流式解压 Sing-Box v${latest_tag} (${sb_arch})..."
+    log_info "正在下载 Sing-Box v${latest_tag} (${sb_arch})..."
 
-    # 使用 /root/.sb_tmp 磁盘路径流式解压，避开 /tmp 64MB 内存盘空间限制
-    if curl -fsSL "$download_url" | tar -xz -C "$tmp_dir"; then
+    # 分步落盘到磁盘目录并立即清理压缩包，兼顾 pipefail 稳定性与防内存盘溢出
+    if curl -fsSL "$download_url" -o "${tmp_dir}/sb.tar.gz"; then
+        tar -xzf "${tmp_dir}/sb.tar.gz" -C "$tmp_dir"
+        rm -f "${tmp_dir}/sb.tar.gz"
         install -m 755 "${tmp_dir}/sing-box-${latest_tag}-linux-${sb_arch}/sing-box" /usr/bin/sing-box
         rm -rf "$tmp_dir"
         setup_alpine_openrc
@@ -371,7 +391,7 @@ install_node() {
 
     local inbounds_json="[]"
     local info_json="{}"
-    local r_port="" t_port=""
+    local r_port="" r_ext_port="" t_port="" t_ext_port=""
 
     # 1) 配置 AnyReality
     if [[ "$mode" == "1" || "$mode" == "3" ]]; then
@@ -379,7 +399,7 @@ install_node() {
         echo -e "${CYAN}(提示: 若为 NAT 共享 IP 机器，请输入面板分配给你的可用转发端口)${NC}"
 
         while :; do
-            read -rp " 请输入端口 [默认: 1443]: " r_port
+            read -rp " 请输入本机监听端口 [默认: 1443]: " r_port
             r_port=${r_port:-1443}
             if ! validate_port "$r_port"; then
                 log_warn "端口号不合法，请输入 1-65535 之间的整数。"
@@ -391,12 +411,22 @@ install_node() {
             break
         done
 
+        while :; do
+            read -rp " 请输入外部映射端口 (NAT 内外端口不同请填写，相同直接回车) [默认: ${r_port}]: " r_ext_port
+            r_ext_port=${r_ext_port:-$r_port}
+            if ! validate_port "$r_ext_port"; then
+                log_warn "外部端口号不合法，请输入 1-65535 之间的整数。"
+                continue
+            fi
+            break
+        done
+
         local r_pwd r_sni
         read -rp " 请输入密码 [默认: 自动生成]: " r_pwd
         r_pwd=${r_pwd:-$(openssl rand -hex 16)}
 
-        read -rp " 请输入 Reality 伪装域名 [默认: www.microsoft.com]: " r_sni
-        r_sni=${r_sni:-www.microsoft.com}
+        read -rp " 请输入 Reality 伪装域名 [默认: genshin.hoyoverse.com]: " r_sni
+        r_sni=${r_sni:-genshin.hoyoverse.com}
 
         log_info "正在生成 REALITY 密钥对..."
         local keypair
@@ -432,8 +462,8 @@ install_node() {
             }')
 
         inbounds_json=$(echo "$inbounds_json" | jq --argjson new "$r_inbound" '. + [$new]')
-        info_json=$(echo "$info_json" | jq --arg p "$r_port" --arg w "$r_pwd" --arg s "$r_sni" --arg pk "$pub_key" --arg id "$short_id" \
-            '. + {reality: {port: $p, pwd: $w, sni: $s, pk: $pk, id: $id}}')
+        info_json=$(echo "$info_json" | jq --arg p "$r_port" --arg ep "$r_ext_port" --arg w "$r_pwd" --arg s "$r_sni" --arg pk "$pub_key" --arg id "$short_id" \
+            '. + {reality: {port: $p, ext_port: $ep, pwd: $w, sni: $s, pk: $pk, id: $id}}')
 
         open_firewall_port "$r_port"
         log_success "AnyReality 参数配置完成！"
@@ -445,7 +475,7 @@ install_node() {
         echo -e "${CYAN}(提示: 若为 NAT 共享 IP 机器，请输入面板分配给你的可用转发端口)${NC}"
 
         while :; do
-            read -rp " 请输入端口 [默认: 2026]: " t_port
+            read -rp " 请输入本机监听端口 [默认: 2026]: " t_port
             t_port=${t_port:-2026}
             if ! validate_port "$t_port"; then
                 log_warn "端口号不合法，请输入 1-65535 之间的整数。"
@@ -461,12 +491,22 @@ install_node() {
             break
         done
 
+        while :; do
+            read -rp " 请输入外部映射端口 (NAT 内外端口不同请填写，相同直接回车) [默认: ${t_port}]: " t_ext_port
+            t_ext_port=${t_ext_port:-$t_port}
+            if ! validate_port "$t_ext_port"; then
+                log_warn "外部端口号不合法，请输入 1-65535 之间的整数。"
+                continue
+            fi
+            break
+        done
+
         local t_pwd t_sni
         read -rp " 请输入密码 [默认: 自动生成]: " t_pwd
         t_pwd=${t_pwd:-$(openssl rand -hex 16)}
 
-        read -rp " 请输入 TLS 伪装域名 [默认: www.microsoft.com]: " t_sni
-        t_sni=${t_sni:-www.microsoft.com}
+        read -rp " 请输入 TLS 伪装域名 [默认: genshin.hoyoverse.com]: " t_sni
+        t_sni=${t_sni:-genshin.hoyoverse.com}
 
         generate_cert "$t_sni"
 
@@ -478,7 +518,7 @@ install_node() {
                 type: "anytls",
                 listen: "::",
                 listen_port: ($p | tonumber),
-                users: [{ password: $w }],
+                users: [{ name: "user", password: $w }],
                 padding_scheme: ["stop=8","0=30-80","1=100-400","2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000","3=9-9,500-1000","4=500-1000","5=500-1000","6=500-1000","7=500-1000"],
                 tls: {
                     enabled: true,
@@ -488,22 +528,46 @@ install_node() {
             }')
 
         inbounds_json=$(echo "$inbounds_json" | jq --argjson new "$t_inbound" '. + [$new]')
-        info_json=$(echo "$info_json" | jq --arg p "$t_port" --arg w "$t_pwd" --arg s "$t_sni" \
-            '. + {anytls: {port: $p, pwd: $w, sni: $s}}')
+        info_json=$(echo "$info_json" | jq --arg p "$t_port" --arg ep "$t_ext_port" --arg w "$t_pwd" --arg s "$t_sni" \
+            '. + {anytls: {port: $p, ext_port: $ep, pwd: $w, sni: $s}}')
 
         open_firewall_port "$t_port"
         log_success "AnyTLS 参数配置完成！"
     fi
 
     # 保存配置：log level 设为 error 以消除日常磁盘 IO 占用
+    # 若检测到具备公网 IPv4，强制锁定 ipv4_only 出站与 DNS，规避机房 IPv6 导致的 YouTube 超长广告风控
     echo "$info_json" > "$INFO_PATH"
     chmod 600 "$INFO_PATH"
     mkdir -p "$(dirname "$CONFIG_PATH")"
-    jq -n --argjson ib "$inbounds_json" '{
-        log: {level: "error", timestamp: true},
-        inbounds: $ib,
-        outbounds: [{type: "direct", tag: "direct"}]
-    }' > "$CONFIG_PATH"
+
+    if has_public_ipv4; then
+        log_info "检测到本机具备公网 IPv4 出口，已自动锁定 IPv4 出站策略以规避 YouTube 风控广告..."
+        jq -n --argjson ib "$inbounds_json" '{
+            log: {level: "error", timestamp: true},
+            dns: {
+                servers: [
+                    { tag: "google", address: "https://8.8.8.8/dns-query", strategy: "ipv4_only" }
+                ],
+                strategy: "ipv4_only"
+            },
+            inbounds: $ib,
+            outbounds: [
+                {
+                    type: "direct",
+                    tag: "direct",
+                    domain_strategy: "ipv4_only"
+                }
+            ]
+        }' > "$CONFIG_PATH"
+    else
+        log_info "检测到纯 IPv6 环境，已配置 IPv6 兼容出站策略..."
+        jq -n --argjson ib "$inbounds_json" '{
+            log: {level: "error", timestamp: true},
+            inbounds: $ib,
+            outbounds: [{type: "direct", tag: "direct"}]
+        }' > "$CONFIG_PATH"
+    fi
     chmod 600 "$CONFIG_PATH"
 
     if ! /usr/bin/sing-box check -c "$CONFIG_PATH"; then
@@ -521,7 +585,7 @@ install_node() {
 }
 
 # ------------------------------------------------------------------------------
-# 节点链接展示 (兼容纯 IPv6 方括号包裹)
+# 节点链接展示 (兼容纯 IPv6 方括号包裹与 NAT 外部端口)
 # ------------------------------------------------------------------------------
 show_links() {
     clear
@@ -541,18 +605,22 @@ show_links() {
     echo -e "${CYAN}=====================================================${NC}\n"
 
     if jq -e .reality "$INFO_PATH" >/dev/null 2>&1; then
-        local p w s k d
+        local p ep w s k d
         p=$(jq -r .reality.port "$INFO_PATH")
+        ep=$(jq -r '.reality.ext_port // .reality.port' "$INFO_PATH")
         w=$(jq -r .reality.pwd "$INFO_PATH")
         s=$(jq -r .reality.sni "$INFO_PATH")
         k=$(jq -r .reality.pk "$INFO_PATH")
         d=$(jq -r .reality.id "$INFO_PATH")
 
+        if [[ "$p" != "$ep" ]]; then
+            echo -e "${BLUE}[提示] 内网监听端口: ${p} -> 外部连接端口: ${ep}${NC}"
+        fi
         echo -e "${GREEN}[ AnyReality 节点链接 ]: ${NC}"
-        echo -e "${YELLOW}anytls://${w}@${host}:${p}/?sni=${s}&fp=chrome&pbk=${k}&sid=${d}#AnyReality_${ip}${NC}\n"
+        echo -e "${YELLOW}anytls://${w}@${host}:${ep}/?sni=${s}&fp=chrome&pbk=${k}&sid=${d}#AnyReality_${ip}${NC}\n"
 
         echo -e "${GREEN}[ Sing-Box 客户端 outbound JSON ]: ${NC}"
-        jq -n --arg server "$ip" --argjson port "$p" --arg password "$w" --arg sni "$s" --arg pk "$k" --arg sid "$d" '{
+        jq -n --arg server "$ip" --argjson port "$ep" --arg password "$w" --arg sni "$s" --arg pk "$k" --arg sid "$d" '{
             type: "anytls",
             tag: "anytls-reality-out",
             server: $server,
@@ -569,13 +637,17 @@ show_links() {
     fi
 
     if jq -e .anytls "$INFO_PATH" >/dev/null 2>&1; then
-        local p w s
+        local p ep w s
         p=$(jq -r .anytls.port "$INFO_PATH")
+        ep=$(jq -r '.anytls.ext_port // .anytls.port' "$INFO_PATH")
         w=$(jq -r .anytls.pwd "$INFO_PATH")
         s=$(jq -r .anytls.sni "$INFO_PATH")
 
+        if [[ "$p" != "$ep" ]]; then
+            echo -e "${BLUE}[提示] 内网监听端口: ${p} -> 外部连接端口: ${ep}${NC}"
+        fi
         echo -e "${GREEN}[ AnyTLS 节点链接 ]: ${NC}"
-        echo -e "${YELLOW}anytls://${w}@${host}:${p}/?sni=${s}&insecure=1#AnyTLS_${ip}${NC}\n"
+        echo -e "${YELLOW}anytls://${w}@${host}:${ep}/?sni=${s}&insecure=1#AnyTLS_${ip}${NC}\n"
     fi
     echo -e "${CYAN}=====================================================${NC}"
     pause
@@ -659,7 +731,7 @@ uninstall_all() {
         if is_alpine; then
             rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
             rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true
-            killall sing-box >/dev/null 2>&1 || true
+            kill_singbox_procs
             rm -f /etc/init.d/"$SERVICE_NAME" "$LOG_FILE"
         else
             systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
