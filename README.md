@@ -23,16 +23,16 @@ Run the following command as `root` on your Linux VPS (Debian / Ubuntu / CentOS 
 ### Debian/Ubuntu
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/B-Zayne/One-Click-for-Anytls-Reality/refs/heads/main/Any-sh-v2.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/B-Zayne/One-Click-for-Anytls-Reality/refs/heads/main/Any.sh)
 ```
 
 ## Alpine
 
 ```bash
-apk update && apk add --no-cache bash curl && curl -fsSL https://raw.githubusercontent.com/B-Zayne/One-Click-for-Anytls-Reality/refs/heads/main/Any-sh-v2.sh -o /root/any.sh && chmod +x /root/any.sh && bash /root/any.sh
+apk update && apk add --no-cache bash curl && curl -fsSL https://raw.githubusercontent.com/B-Zayne/One-Click-for-Anytls-Reality/refs/heads/main/Any.sh -o /root/any.sh && chmod +x /root/any.sh && bash /root/any.sh
 ```
 
 ### Alpine 128RAM
 ```bash
-apk update && apk add --no-cache bash curl && rm -rf /var/cache/apk/* && curl -fsSL https://raw.githubusercontent.com/B-Zayne/One-Click-for-Anytls-Reality/refs/heads/main/any-v2.2-for-alpine128.sh -o /root/any.sh && chmod +x /root/any.sh && bash /root/any.sh
+apk update && apk add --no-cache bash curl && rm -rf /var/cache/apk/* && curl -fsSL https://raw.githubusercontent.com/B-Zayne/One-Click-for-Anytls-Reality/refs/heads/main/any128.sh -o /root/any128.sh && chmod +x /root/any128.sh && bash /root/any128.sh
 ```
