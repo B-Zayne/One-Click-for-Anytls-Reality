@@ -10,7 +10,8 @@ readonly INFO_PATH="/root/.sb_info.json"
 readonly TLS_DIR="/root/AnyTLS/tls"
 readonly LOG_FILE="/var/log/sing-box.log"
 readonly SERVICE_NAME="sing-box"
-readonly LOCAL_SCRIPT_PATH="/root/any.sh"
+readonly LOCAL_SCRIPT_PATH="/root/any128.sh"
+readonly REPO_RAW_URL="https://raw.githubusercontent.com/B-Zayne/One-Click-for-Anytls-Reality/refs/heads/main/any128.sh"
 
 # 颜色与样式
 readonly RED='\033[0;31m'
@@ -20,13 +21,6 @@ readonly BLUE='\033[0;34m'
 readonly CYAN='\033[0;36m'
 readonly BOLD='\033[1m'
 readonly NC='\033[0m'
-
-# ------------------------------------------------------------------------------
-# 系统环境识别
-# ------------------------------------------------------------------------------
-is_alpine() {
-    [[ -f /etc/alpine-release ]] || command -v apk &>/dev/null
-}
 
 # ------------------------------------------------------------------------------
 # 辅助 UI 与工具函数
@@ -48,7 +42,7 @@ check_root() {
     fi
 }
 
-# 兼容性杀进程辅助函数 (不依赖 killall / pkill / xargs -r)
+# 兼容性杀进程函数 (适配 Alpine BusyBox，不依赖 pkill/killall)
 kill_singbox_procs() {
     local pids
     pids=$(pidof sing-box 2>/dev/null || true)
@@ -64,8 +58,15 @@ kill_singbox_procs() {
 # ------------------------------------------------------------------------------
 force_register_shortcut() {
     if [[ -s "$0" && "$0" != "/dev/fd/"* && "$0" != "/proc/"* && "$0" != "bash" && "$0" != "-bash" ]]; then
-        cp -f "$0" "$LOCAL_SCRIPT_PATH" 2>/dev/null || true
+        if [[ "$(realpath "$0" 2>/dev/null)" != "$LOCAL_SCRIPT_PATH" ]]; then
+            cp -f "$0" "$LOCAL_SCRIPT_PATH" 2>/dev/null || true
+        fi
     fi
+
+    if [[ ! -s "$LOCAL_SCRIPT_PATH" ]]; then
+        curl -fsSL "$REPO_RAW_URL" -o "$LOCAL_SCRIPT_PATH" 2>/dev/null || true
+    fi
+
     chmod +x "$LOCAL_SCRIPT_PATH" 2>/dev/null || true
 
     local target_paths=("/usr/local/bin/any" "/usr/bin/any")
@@ -74,10 +75,10 @@ force_register_shortcut() {
         rm -rf "$path" 2>/dev/null || true
         cat << 'EOF' > "$path"
 #!/usr/bin/env bash
-if [[ -f /root/any.sh ]]; then
-    exec bash /root/any.sh "$@"
+if [[ -f /root/any128.sh ]]; then
+    exec bash /root/any128.sh "$@"
 else
-    echo "未找到本地脚本 /root/any.sh，请重新下载运行。"
+    echo "未找到本地脚本 /root/any128.sh，请重新运行一键安装命令。"
     exit 1
 fi
 EOF
@@ -91,7 +92,7 @@ validate_port() {
     [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
 }
 
-# 检测端口占用 (兼容 BusyBox ss / netstat / lsof)
+# 检测端口占用 (适配 Alpine BusyBox ss / netstat)
 check_and_print_port_status() {
     local port="$1"
     local is_busy=0
@@ -100,8 +101,6 @@ check_and_print_port_status() {
         ss -tuln 2>/dev/null | grep -qE ":${port}([[:space:]]|$)" && is_busy=1
     elif command -v netstat &>/dev/null; then
         netstat -tuln 2>/dev/null | grep -qE ":${port}([[:space:]]|$)" && is_busy=1
-    elif command -v lsof &>/dev/null; then
-        lsof -i:"${port}" &>/dev/null && is_busy=1
     fi
 
     if [[ $is_busy -eq 1 ]]; then
@@ -120,7 +119,7 @@ has_public_ipv4() {
     [[ -n "$ip4" && "$ip4" != *:* ]]
 }
 
-# 获取公网 IP
+# 获取公网 IP (兼容纯 IPv4 / 双栈 / 纯 IPv6)
 get_public_ip() {
     local ip
     ip=$(curl -s4 --connect-timeout 5 https://api.ipify.org 2>/dev/null || true)
@@ -130,85 +129,24 @@ get_public_ip() {
     echo "${ip:-127.0.0.1}"
 }
 
-# 自动放行防火墙端口 (兼容 Alpine iptables / UFW / Firewalld)
+# 自动放行 Alpine iptables 防火墙端口
 open_firewall_port() {
     local port="$1"
-    log_info "正在检查并放行防火墙端口 ${port}..."
-    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
-        ufw allow "${port}/tcp" >/dev/null 2>&1 || true
-        log_success "UFW 防火墙端口 ${port} 放行成功！"
-    elif command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
-        firewall-cmd --zone=public --add-port="${port}/tcp" --permanent >/dev/null 2>&1 || true
-        firewall-cmd --reload >/dev/null 2>&1 || true
-        log_success "Firewalld 防火墙端口 ${port} 放行成功！"
-    elif command -v iptables &>/dev/null; then
+    if command -v iptables &>/dev/null; then
+        log_info "正在检查并放行 iptables 端口 ${port}..."
         if ! iptables -C INPUT -p tcp --dport "${port}" -j ACCEPT >/dev/null 2>&1; then
             iptables -I INPUT -p tcp --dport "${port}" -j ACCEPT >/dev/null 2>&1 || true
-            if is_alpine && [[ -x /etc/init.d/iptables ]]; then
-                /etc/init.d/iptables save >/dev/null 2>&1 || true
-            fi
+            [[ -x /etc/init.d/iptables ]] && /etc/init.d/iptables save >/dev/null 2>&1 || true
         fi
-        log_success "iptables 端口 ${port} 已放行！"
+        log_success "iptables 端口 ${port} 放行完成！"
     fi
 }
 
 # ------------------------------------------------------------------------------
-# 服务控制与 128M 低内存优化层 (兼容 OpenRC / 无 OpenRC 容器 / Systemd)
+# Alpine 128M 专属服务控制层 (OpenRC + 无 OpenRC 容器双兼容)
 # ------------------------------------------------------------------------------
-svc_is_active() {
-    if is_alpine; then
-        rc-service "$SERVICE_NAME" status >/dev/null 2>&1 || pidof sing-box >/dev/null 2>&1
-    else
-        systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null
-    fi
-}
-
-svc_start() {
-    if is_alpine; then
-        if ! rc-service "$SERVICE_NAME" start >/dev/null 2>&1; then
-            pidof sing-box >/dev/null 2>&1 || GOGC=50 GOMEMLIMIT=64MiB nohup /usr/bin/sing-box run -c "$CONFIG_PATH" >/dev/null 2>"$LOG_FILE" &
-        fi
-    else
-        systemctl start "$SERVICE_NAME"
-    fi
-}
-
-svc_stop() {
-    if is_alpine; then
-        rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
-        kill_singbox_procs
-    else
-        systemctl stop "$SERVICE_NAME"
-    fi
-}
-
-setup_systemd_mem_limit() {
-    if [[ -d /etc/systemd/system ]]; then
-        mkdir -p /etc/systemd/system/sing-box.service.d
-        cat << 'EOF' > /etc/systemd/system/sing-box.service.d/lowmem.conf
-[Service]
-Environment="GOGC=50"
-Environment="GOMEMLIMIT=64MiB"
-EOF
-    fi
-}
-
-svc_restart() {
-    if is_alpine; then
-        rc-update add "$SERVICE_NAME" default >/dev/null 2>&1 || true
-        if ! rc-service "$SERVICE_NAME" restart >/dev/null 2>&1; then
-            kill_singbox_procs
-            GOGC=50 GOMEMLIMIT=64MiB nohup /usr/bin/sing-box run -c "$CONFIG_PATH" >/dev/null 2>"$LOG_FILE" &
-        fi
-    else
-        setup_systemd_mem_limit
-        systemctl daemon-reload
-        systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
-        systemctl restart "$SERVICE_NAME"
-    fi
-}
-
 setup_alpine_openrc() {
+    mkdir -p /etc/init.d
     cat << 'EOF' > /etc/init.d/sing-box
 #!/sbin/openrc-run
 
@@ -221,7 +159,7 @@ pidfile="/run/${RC_SVCNAME}.pid"
 output_log="/dev/null"
 error_log="/var/log/sing-box.log"
 
-# 128M 内存容器 Go 运行时硬上限限制，防 OOM 与高 IO 限速
+# 128M 内存容器 Go 运行时硬上限限制，防 OOM 杀进程与高磁盘 IO 限速
 export GOGC=50
 export GOMEMLIMIT=64MiB
 
@@ -231,10 +169,39 @@ depend() {
 }
 EOF
     chmod +x /etc/init.d/sing-box
-    rc-update add "$SERVICE_NAME" default >/dev/null 2>&1 || true
+    command -v rc-update &>/dev/null && rc-update add "$SERVICE_NAME" default >/dev/null 2>&1 || true
 }
 
-# 打印当前系统的安装与运行状态卡片 (读取 /proc 原生 VmRSS 兼容所有 BusyBox)
+svc_is_active() {
+    if command -v rc-service &>/dev/null && rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then
+        return 0
+    fi
+    pidof sing-box >/dev/null 2>&1
+}
+
+svc_start() {
+    if command -v rc-service &>/dev/null; then
+        rc-service "$SERVICE_NAME" start >/dev/null 2>&1 && return 0
+    fi
+    if ! pidof sing-box >/dev/null 2>&1; then
+        GOGC=50 GOMEMLIMIT=64MiB nohup /usr/bin/sing-box run -c "$CONFIG_PATH" >/dev/null 2>"$LOG_FILE" &
+        sleep 1
+    fi
+}
+
+svc_stop() {
+    if command -v rc-service &>/dev/null; then
+        rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
+    fi
+    kill_singbox_procs
+}
+
+svc_restart() {
+    svc_stop
+    svc_start
+}
+
+# 打印当前系统的安装与运行状态卡片 (读取 /proc 原生 VmRSS 精确统计物理内存)
 print_system_status() {
     echo -e "${CYAN}-----------------------------------------------------${NC}"
     if [[ -f "$CONFIG_PATH" && -f "$INFO_PATH" ]]; then
@@ -257,7 +224,7 @@ print_system_status() {
             else
                 rss_mb="未知"
             fi
-            echo -e " 服务状态: ${GREEN}${BOLD}● 运行中${NC} (PID: ${pid:-未知} | 内存占用: ${CYAN}${rss_mb}${NC})"
+            echo -e " 服务状态: ${GREEN}${BOLD}● 运行中${NC} (PID: ${pid:-未知} | 物理内存: ${CYAN}${rss_mb}${NC})"
             echo -e " 已配置项: ${CYAN}${installed_proto}${NC} [128M低内存模式]"
         else
             echo -e " 服务状态: ${YELLOW}${BOLD}● 已安装但未运行 (已停止)${NC}"
@@ -270,7 +237,7 @@ print_system_status() {
 }
 
 # ------------------------------------------------------------------------------
-# 依赖与 Sing-Box 内核安装 (Alpine 专用静态包 + 磁盘目录安全解压)
+# 依赖与 Sing-Box 内核安装 (防 tmpfs 内存盘溢出安全解压)
 # ------------------------------------------------------------------------------
 install_singbox_alpine() {
     local arch sb_arch latest_tag download_url tmp_dir="/root/.sb_tmp"
@@ -293,14 +260,14 @@ install_singbox_alpine() {
     rm -rf "$tmp_dir" && mkdir -p "$tmp_dir"
     log_info "正在下载 Sing-Box v${latest_tag} (${sb_arch})..."
 
-    # 分步落盘到磁盘目录并立即清理压缩包，兼顾 pipefail 稳定性与防内存盘溢出
+    # 落盘到 /root/.sb_tmp 解压并立即删包，防止 /tmp 内存盘爆满导致死机
     if curl -fsSL "$download_url" -o "${tmp_dir}/sb.tar.gz"; then
         tar -xzf "${tmp_dir}/sb.tar.gz" -C "$tmp_dir"
         rm -f "${tmp_dir}/sb.tar.gz"
         install -m 755 "${tmp_dir}/sing-box-${latest_tag}-linux-${sb_arch}/sing-box" /usr/bin/sing-box
         rm -rf "$tmp_dir"
         setup_alpine_openrc
-        log_success "Sing-Box v${latest_tag} 安装及 128M 低内存守护注册成功！"
+        log_success "Sing-Box v${latest_tag} 安装及 128M 低内存守护配置完成！"
     else
         rm -rf "$tmp_dir"
         log_error "下载或解压 Sing-Box 失败，请检查网络连接或磁盘空间。"
@@ -309,38 +276,19 @@ install_singbox_alpine() {
 }
 
 install_dependencies() {
-    log_info "检查并安装必要依赖组件..."
+    log_info "正在安装 Alpine 必要轻量组件 (无缓存模式)..."
     rm -f /etc/sing-box/client_info.json
 
-    if is_alpine; then
-        apk update -q
-        apk add --no-cache -q bash curl jq openssl iproute2 tar ca-certificates openrc
-        install_singbox_alpine || { rm -rf /var/cache/apk/*; pause; return 1; }
-        rm -rf /var/cache/apk/*
-    else
-        if command -v apt-get &>/dev/null; then
-            apt-get update -y -qq
-            apt-get install -y -qq curl jq iproute2 openssl lsof ca-certificates
-            apt-get clean
-        elif command -v dnf &>/dev/null; then
-            dnf install -y -q curl jq iproute openssl lsof ca-certificates
-        elif command -v yum &>/dev/null; then
-            yum install -y -q curl jq iproute openssl lsof ca-certificates
-        fi
+    # 使用 --no-cache 避免写入本地索引缓存，节省内存与磁盘空间
+    local pkgs="bash curl jq openssl iproute2 tar ca-certificates"
+    [[ -d /run/openrc ]] && pkgs="$pkgs openrc"
 
-        log_info "正在安装/更新 Sing-Box (官方正式版内核)..."
-        if curl -fsSL https://sing-box.app/install.sh | sh; then
-            log_success "Sing-Box 核心组件安装/更新完毕！"
-        else
-            log_error "Sing-Box 安装失败，请检查服务器网络。"
-            pause
-            return 1
-        fi
-    fi
+    apk add --no-cache -q $pkgs
+    install_singbox_alpine || { pause; return 1; }
 }
 
 # ------------------------------------------------------------------------------
-# 证书生成模块 (POSIX 兼容写法)
+# 证书生成模块 (POSIX 兼容写法，避免进程替换在部分容器报错)
 # ------------------------------------------------------------------------------
 generate_cert() {
     local sni="$1"
@@ -370,7 +318,7 @@ generate_cert() {
 install_node() {
     clear
     echo -e "${CYAN}=====================================================${NC}"
-    echo -e "${BOLD}             配置 Sing-Box 节点协议                 ${NC}"
+    echo -e "${BOLD}         配置 Sing-Box 节点 (Alpine 128M 版)         ${NC}"
     echo -e "${CYAN}=====================================================${NC}"
     echo -e " 1. 单独部署 ${BOLD}AnyReality${NC}"
     echo -e " 2. 单独部署 ${BOLD}AnyTLS${NC}"
@@ -396,7 +344,7 @@ install_node() {
     # 1) 配置 AnyReality
     if [[ "$mode" == "1" || "$mode" == "3" ]]; then
         echo -e "\n${YELLOW}>>>> 开始配置 AnyReality <<<<${NC}"
-        echo -e "${CYAN}(提示: 若为 NAT 共享 IP 机器，请输入面板分配给你的可用转发端口)${NC}"
+        echo -e "${CYAN}(提示: 若为 NAT 共享 IP 机器，请输入面板分配给你的可用端口)${NC}"
 
         while :; do
             read -rp " 请输入本机监听端口 [默认: 1443]: " r_port
@@ -412,7 +360,7 @@ install_node() {
         done
 
         while :; do
-            read -rp " 请输入外部映射端口 (NAT 内外端口不同请填写，相同直接回车) [默认: ${r_port}]: " r_ext_port
+            read -rp " 请输入外部连接端口 (NAT 内外端口不同请填写，相同直接回车) [默认: ${r_port}]: " r_ext_port
             r_ext_port=${r_ext_port:-$r_port}
             if ! validate_port "$r_ext_port"; then
                 log_warn "外部端口号不合法，请输入 1-65535 之间的整数。"
@@ -472,7 +420,7 @@ install_node() {
     # 2) 配置 AnyTLS
     if [[ "$mode" == "2" || "$mode" == "3" ]]; then
         echo -e "\n${YELLOW}>>>> 开始配置 AnyTLS <<<<${NC}"
-        echo -e "${CYAN}(提示: 若为 NAT 共享 IP 机器，请输入面板分配给你的可用转发端口)${NC}"
+        echo -e "${CYAN}(提示: 若为 NAT 共享 IP 机器，请输入面板分配给你的可用端口)${NC}"
 
         while :; do
             read -rp " 请输入本机监听端口 [默认: 2026]: " t_port
@@ -492,7 +440,7 @@ install_node() {
         done
 
         while :; do
-            read -rp " 请输入外部映射端口 (NAT 内外端口不同请填写，相同直接回车) [默认: ${t_port}]: " t_ext_port
+            read -rp " 请输入外部连接端口 (NAT 内外端口不同请填写，相同直接回车) [默认: ${t_port}]: " t_ext_port
             t_ext_port=${t_ext_port:-$t_port}
             if ! validate_port "$t_ext_port"; then
                 log_warn "外部端口号不合法，请输入 1-65535 之间的整数。"
@@ -535,22 +483,15 @@ install_node() {
         log_success "AnyTLS 参数配置完成！"
     fi
 
-    # 保存配置：log level 设为 error 以消除日常磁盘 IO 占用
-    # 若检测到具备公网 IPv4，强制锁定 ipv4_only 出站与 DNS，规避机房 IPv6 导致的 YouTube 超长广告风控
+    # 保存配置：log level 设为 error 消除磁盘日常 IO 占用；无内置 DoH 模块节省常驻内存
     echo "$info_json" > "$INFO_PATH"
     chmod 600 "$INFO_PATH"
     mkdir -p "$(dirname "$CONFIG_PATH")"
 
     if has_public_ipv4; then
-        log_info "检测到本机具备公网 IPv4 出口，已自动锁定 IPv4 出站策略以规避 YouTube 风控广告..."
+        log_info "检测到本机具备公网 IPv4 出口，已锁定 IPv4 出站策略..."
         jq -n --argjson ib "$inbounds_json" '{
             log: {level: "error", timestamp: true},
-            dns: {
-                servers: [
-                    { tag: "google", address: "https://8.8.8.8/dns-query", strategy: "ipv4_only" }
-                ],
-                strategy: "ipv4_only"
-            },
             inbounds: $ib,
             outbounds: [
                 {
@@ -576,7 +517,7 @@ install_node() {
         return 1
     fi
 
-    log_info "正在启动与重载 Sing-Box 服务..."
+    log_info "正在启动 Sing-Box 服务..."
     svc_restart
 
     log_success "恭喜！Sing-Box 节点配置与部署完全成功！"
@@ -683,21 +624,19 @@ show_status() {
     echo -e "${CYAN}=====================================================${NC}"
     echo -e "${BOLD}          Sing-Box 运行状态与内存占用               ${NC}"
     echo -e "${CYAN}=====================================================${NC}\n"
-    if is_alpine; then
+    if command -v rc-service &>/dev/null; then
         rc-service "$SERVICE_NAME" status 2>/dev/null || true
         echo
-        free -m 2>/dev/null || true
-        echo
-        local pid rss_mb
-        pid=$(pidof sing-box 2>/dev/null | awk '{print $1}' || echo "")
-        if [[ -n "$pid" && -r "/proc/${pid}/status" ]]; then
-            rss_mb=$(awk '/VmRSS/ {printf "%.1f MB", $2/1024}' "/proc/${pid}/status" 2>/dev/null || echo "未知")
-            echo -e " Sing-Box 进程 PID: ${GREEN}${pid}${NC} | 实际物理内存 (VmRSS): ${GREEN}${rss_mb}${NC}"
-        else
-            echo -e " Sing-Box 进程: ${RED}未运行${NC}"
-        fi
+    fi
+    free -m 2>/dev/null || true
+    echo
+    local pid rss_mb
+    pid=$(pidof sing-box 2>/dev/null | awk '{print $1}' || echo "")
+    if [[ -n "$pid" && -r "/proc/${pid}/status" ]]; then
+        rss_mb=$(awk '/VmRSS/ {printf "%.1f MB", $2/1024}' "/proc/${pid}/status" 2>/dev/null || echo "未知")
+        echo -e " Sing-Box 进程 PID: ${GREEN}${pid}${NC} | 实际物理内存 (VmRSS): ${GREEN}${rss_mb}${NC}"
     else
-        systemctl status "$SERVICE_NAME" --no-pager || true
+        echo -e " Sing-Box 进程: ${RED}未运行${NC}"
     fi
     echo -e "\n${CYAN}=====================================================${NC}"
     pause
@@ -708,14 +647,10 @@ show_logs() {
     echo -e "${CYAN}=====================================================${NC}"
     echo -e "${BOLD}      正在查看错误日志 (退出实时预览按 Ctrl+C)      ${NC}"
     echo -e "${CYAN}=====================================================${NC}\n"
-    if is_alpine; then
-        if [[ -f "$LOG_FILE" ]]; then
-            tail -n 50 -f "$LOG_FILE" || true
-        else
-            log_info "当前无错误日志记录（已启用低 IO 模式，仅在发生错误时写入）。"
-        fi
+    if [[ -f "$LOG_FILE" ]]; then
+        tail -n 50 -f "$LOG_FILE" || true
     else
-        journalctl -u "$SERVICE_NAME" -e -f -n 50 || true
+        log_info "当前无错误日志记录（已启用低 IO 模式，仅在发生错误时写入）。"
     fi
     pause
 }
@@ -728,18 +663,10 @@ uninstall_all() {
     read -rp " 确定要彻底卸载 Sing-Box 及其所有配置文件吗？[y/N]: " confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
         log_info "正在清理并卸载..."
-        if is_alpine; then
-            rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
-            rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true
-            kill_singbox_procs
-            rm -f /etc/init.d/"$SERVICE_NAME" "$LOG_FILE"
-        else
-            systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
-            systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
-            rm -rf /etc/systemd/system/"$SERVICE_NAME".service /etc/systemd/system/sing-box.service.d
-            systemctl daemon-reload
-        fi
+        svc_stop
+        command -v rc-update &>/dev/null && rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true
 
+        rm -f /etc/init.d/"$SERVICE_NAME" "$LOG_FILE"
         rm -f /usr/bin/"$SERVICE_NAME" /usr/local/bin/"$SERVICE_NAME" /usr/local/bin/any /usr/bin/any "$LOCAL_SCRIPT_PATH"
         rm -rf /etc/"$SERVICE_NAME" "$INFO_PATH" /root/AnyTLS /root/.sb_tmp
 
@@ -760,7 +687,7 @@ main_menu() {
     while :; do
         clear
         echo -e "${CYAN}=====================================================${NC}"
-        echo -e "${BOLD}       Sing-Box (AnyTLS / AnyReality) 管理脚本       ${NC}"
+        echo -e "${BOLD}    Sing-Box (AnyTLS / AnyReality) [Alpine 128M]     ${NC}"
         echo -e "         快捷指令: 在终端输入 ${YELLOW}${BOLD}any${NC} 即可快速打开"
 
         print_system_status
