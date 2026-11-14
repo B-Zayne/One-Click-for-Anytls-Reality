@@ -112,10 +112,13 @@ check_and_print_port_status() {
     fi
 }
 
-# 检测本机是否具备有效公网 IPv4 出口
+# 双源检测本机是否具备有效公网 IPv4 出口 (防止 NAT 共享 IP 单源超时误判)
 has_public_ipv4() {
     local ip4
     ip4=$(curl -s4 --connect-timeout 4 https://api.ipify.org 2>/dev/null || true)
+    if [[ -z "$ip4" || "$ip4" == *:* ]]; then
+        ip4=$(curl -s4 --connect-timeout 4 https://4.ipw.cn 2>/dev/null || true)
+    fi
     [[ -n "$ip4" && "$ip4" != *:* ]]
 }
 
@@ -123,6 +126,9 @@ has_public_ipv4() {
 get_public_ip() {
     local ip
     ip=$(curl -s4 --connect-timeout 5 https://api.ipify.org 2>/dev/null || true)
+    if [[ -z "$ip" ]]; then
+        ip=$(curl -s4 --connect-timeout 5 https://4.ipw.cn 2>/dev/null || true)
+    fi
     if [[ -z "$ip" ]]; then
         ip=$(curl -s6 --connect-timeout 5 https://api64.ipify.org 2>/dev/null || true)
     fi
@@ -230,6 +236,10 @@ print_system_status() {
             echo -e " 服务状态: ${YELLOW}${BOLD}● 已安装但未运行 (已停止)${NC}"
             echo -e " 已配置项: ${CYAN}${installed_proto}${NC}"
         fi
+    elif [[ -x /usr/bin/sing-box ]]; then
+        local sb_ver
+        sb_ver=$(/usr/bin/sing-box version 2>/dev/null | awk '/sing-box version/ {print $3}' || echo "已就绪")
+        echo -e " 服务状态: ${YELLOW}${BOLD}○ 内核已安装 (${sb_ver}) / 节点未配置${NC}"
     else
         echo -e " 服务状态: ${RED}${BOLD}○ 未安装 / 未配置${NC}"
     fi
@@ -276,19 +286,24 @@ install_singbox_alpine() {
 }
 
 install_dependencies() {
-    log_info "正在安装 Alpine 必要轻量组件 (无缓存模式)..."
+    log_info "正在检查 Alpine 必要轻量组件 (无缓存模式)..."
     rm -f /etc/sing-box/client_info.json
 
-    # 使用 --no-cache 避免写入本地索引缓存，节省内存与磁盘空间
     local pkgs="bash curl jq openssl iproute2 tar ca-certificates"
     [[ -d /run/openrc ]] && pkgs="$pkgs openrc"
 
     apk add --no-cache -q $pkgs
-    install_singbox_alpine || { pause; return 1; }
+
+    if [[ -x /usr/bin/sing-box ]]; then
+        log_success "检测到本地已存在 Sing-Box 内核，跳过重复下载。"
+        setup_alpine_openrc
+    else
+        install_singbox_alpine || { pause; return 1; }
+    fi
 }
 
 # ------------------------------------------------------------------------------
-# 证书生成模块 (POSIX 兼容写法，避免进程替换在部分容器报错)
+# 证书生成模块 (POSIX 兼容写法)
 # ------------------------------------------------------------------------------
 generate_cert() {
     local sni="$1"
@@ -483,13 +498,13 @@ install_node() {
         log_success "AnyTLS 参数配置完成！"
     fi
 
-    # 保存配置：采用 Sing-Box 1.14+ 原生 route.default_domain_resolver 语法锁定 ipv4_only
+    # 保存配置：双重阻断机房 IPv6 出口（DNS ipv4_only + 路由直接拦截 ::/0），彻底解决 YouTube 加长广告风控
     echo "$info_json" > "$INFO_PATH"
     chmod 600 "$INFO_PATH"
     mkdir -p "$(dirname "$CONFIG_PATH")"
 
     if has_public_ipv4; then
-        log_info "检测到本机具备公网 IPv4 出口，已锁定 IPv4 出站策略..."
+        log_info "检测到本机具备公网 IPv4 出口，已启用纯 IPv4 出口与 IPv6 阻断策略..."
         jq -n --argjson ib "$inbounds_json" '{
             log: {level: "error", timestamp: true},
             dns: {
@@ -502,6 +517,9 @@ install_node() {
                 {type: "direct", tag: "direct"}
             ],
             route: {
+                rules: [
+                    {ip_cidr: ["::/0"], action: "reject"}
+                ],
                 default_domain_resolver: {
                     server: "local",
                     strategy: "ipv4_only"
@@ -662,12 +680,32 @@ show_logs() {
     pause
 }
 
+# 仅清空节点配置与自签证书，保留 Sing-Box 内核与脚本
+clear_config_only() {
+    clear
+    echo -e "${YELLOW}=====================================================${NC}"
+    echo -e "${BOLD}          清空节点配置 (保留 Sing-Box 内核)          ${NC}"
+    echo -e "${YELLOW}=====================================================${NC}"
+    read -rp " 确定要删除当前节点配置及证书（保留内核与脚本）吗？[y/N]: " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        log_info "正在停止服务并清理节点配置文件..."
+        svc_stop
+
+        rm -rf /etc/"$SERVICE_NAME" "$INFO_PATH" /root/AnyTLS "$LOG_FILE"
+
+        log_success "节点配置、密钥与自签证书已全部清空！Sing-Box 内核已保留，随时可选 1 重新配置。"
+    else
+        log_info "已取消清空操作。"
+    fi
+    pause
+}
+
 uninstall_all() {
     clear
     echo -e "${RED}=====================================================${NC}"
-    echo -e "${BOLD}                   卸载 Sing-Box                    ${NC}"
+    echo -e "${BOLD}                 彻底卸载 Sing-Box                  ${NC}"
     echo -e "${RED}=====================================================${NC}"
-    read -rp " 确定要彻底卸载 Sing-Box 及其所有配置文件吗？[y/N]: " confirm
+    read -rp " 确定要彻底卸载 Sing-Box 内核及所有配置文件吗？[y/N]: " confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
         log_info "正在清理并卸载..."
         svc_stop
@@ -704,25 +742,27 @@ main_menu() {
         echo -e " ${GREEN}3.${NC} 查看节点链接"
         echo -e " ${GREEN}4.${NC} 查看运行状态与内存占用"
         echo -e " ${GREEN}5.${NC} 查看错误日志"
-        echo -e " ${RED}6.${NC} 卸载 Sing-Box"
+        echo -e " ${YELLOW}6.${NC} 清空节点配置 (保留 Sing-Box 内核)"
+        echo -e " ${RED}7.${NC} 彻底卸载 Sing-Box"
         echo -e " ${YELLOW}0.${NC} 退出脚本"
         echo -e "${CYAN}=====================================================${NC}"
 
-        read -rp " 请输入选项 [0-6]: " opt
+        read -rp " 请输入选项 [0-7]: " opt
         case "$opt" in
             1) install_node ;;
             2) manage_service ;;
             3) show_links ;;
             4) show_status ;;
             5) show_logs ;;
-            6) uninstall_all ;;
+            6) clear_config_only ;;
+            7) uninstall_all ;;
             0)
                 clear
                 echo -e "${GREEN}感谢使用！随时输入 'any' 唤醒本脚本。${NC}"
                 exit 0
                 ;;
             *)
-                log_error "请输入正确的选项 [0-6]"
+                log_error "请输入正确的选项 [0-7]"
                 sleep 1
                 ;;
         esac
