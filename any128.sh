@@ -483,7 +483,7 @@ install_node() {
         log_success "AnyTLS 参数配置完成！"
     fi
 
-    # 保存配置：log level 设为 error 消除磁盘日常 IO 占用；无内置 DoH 模块节省常驻内存
+    # 保存配置：采用 Sing-Box 1.14+ 原生 route.default_domain_resolver 语法锁定 ipv4_only
     echo "$info_json" > "$INFO_PATH"
     chmod 600 "$INFO_PATH"
     mkdir -p "$(dirname "$CONFIG_PATH")"
@@ -492,14 +492,21 @@ install_node() {
         log_info "检测到本机具备公网 IPv4 出口，已锁定 IPv4 出站策略..."
         jq -n --argjson ib "$inbounds_json" '{
             log: {level: "error", timestamp: true},
+            dns: {
+                servers: [
+                    {type: "local", tag: "local"}
+                ]
+            },
             inbounds: $ib,
             outbounds: [
-                {
-                    type: "direct",
-                    tag: "direct",
-                    domain_strategy: "ipv4_only"
+                {type: "direct", tag: "direct"}
+            ],
+            route: {
+                default_domain_resolver: {
+                    server: "local",
+                    strategy: "ipv4_only"
                 }
-            ]
+            }
         }' > "$CONFIG_PATH"
     else
         log_info "检测到纯 IPv6 环境，已配置 IPv6 兼容出站策略..."
