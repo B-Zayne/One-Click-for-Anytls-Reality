@@ -23,16 +23,11 @@ Run the following command as `root` on your Linux VPS (Debian / Ubuntu / CentOS 
 ### Debian/Ubuntu
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/B-Zayne/One-Click-for-Anytls-Reality/refs/heads/main/Any.sh -o /root/any.sh && bash /root/any.sh
+wget -qO /root/any.sh https://raw.githubusercontent.com/B-Zayne/One-Click-for-Anytls-Reality/refs/heads/main/Any.sh && chmod +x /root/any.sh && bash /root/any.sh
 ```
 
-## Alpine
+### Alpine
 
-```bash
-apk add --no-cache bash curl ca-certificates && curl -fsSL https://raw.githubusercontent.com/B-Zayne/One-Click-for-Anytls-Reality/refs/heads/main/Any.sh -o /root/any.sh && sed -i 's/\r$//' /root/any.sh && chmod +x /root/any.sh && bash /root/any.sh
-```
-
-### Alpine 128RAM
 ```bash
 apk add --no-cache bash curl ca-certificates && curl -fsSL https://raw.githubusercontent.com/B-Zayne/One-Click-for-Anytls-Reality/refs/heads/main/any128.sh -o /root/any128.sh && sed -i 's/\r$//' /root/any128.sh && chmod +x /root/any128.sh && bash /root/any128.sh
 ```
