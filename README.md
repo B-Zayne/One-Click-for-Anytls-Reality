@@ -20,14 +20,13 @@ Designed for anti-DPI stealth, zero-certificate deployment, and high TCP through
 
 Run the following command as `root` on your Linux VPS (Debian / Ubuntu / CentOS / Rocky):
 
-### Debian/Ubuntu
+### Shortcut command
+
+any
+
+
+### Debian/Ubuntu/Alpine
 
 ```bash
-wget -qO /root/any.sh https://raw.githubusercontent.com/B-Zayne/One-Click-for-Anytls-Reality/refs/heads/main/Any.sh && chmod +x /root/any.sh && bash /root/any.sh
-```
+if [ "$(id -u)" != 0 ]; then echo "请先使用 root 登录"; exit 1; fi; if command -v apk >/dev/null 2>&1; then apk add --no-cache bash curl ca-certificates; elif command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y bash curl ca-certificates; else echo "不支持的系统"; exit 1; fi && curl -fsSL "https://raw.githubusercontent.com/B-Zayne/One-Click-for-Anytls-Reality/refs/heads/main/Any-MultiOS-128M-V2.sh" -o /root/Any.sh && bash /root/Any.sh
 
-### Alpine
-
-```bash
-apk add --no-cache bash curl ca-certificates && curl -fsSL https://raw.githubusercontent.com/B-Zayne/One-Click-for-Anytls-Reality/refs/heads/main/any128.sh -o /root/any128.sh && sed -i 's/\r$//' /root/any128.sh && chmod +x /root/any128.sh && bash /root/any128.sh
-```
