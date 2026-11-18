@@ -10,7 +10,7 @@ readonly TLS_DIR=/root/AnyTLS/tls
 readonly SERVICE_NAME=sing-box
 readonly LOCAL_SCRIPT_PATH=/root/any.sh
 readonly REPO_URL=https://raw.githubusercontent.com/xymn2023/AnyTLS/main/Any.sh
-readonly VERSION="2.0.1 (Fixed)"
+readonly VERSION="2.0.2 (Alpine-Fixed)"
 
 RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; BOLD=''; NC=''
 if [[ -t 1 ]]; then
@@ -53,30 +53,67 @@ service_action(){
   fi
 }
 
+ensure_alpine_service(){
+  command -v rc-service >/dev/null 2>&1 || return 0
+  # 强制覆写 apk 自带的低权限启动脚本，确保以 root 运行以读取 600 权限的配置与证书
+  mkdir -p /etc/init.d /var/log
+  cat > /etc/init.d/sing-box <<'EOF'
+#!/sbin/openrc-run
+description="sing-box service"
+command="/usr/bin/sing-box"
+command_args="run -c /etc/sing-box/config.json"
+command_user="root:root"
+command_background="yes"
+pidfile="/run/sing-box.pid"
+output_log="/var/log/sing-box.log"
+error_log="/var/log/sing-box.log"
+depend() {
+  need net
+  after firewall
+}
+EOF
+  chmod 755 /etc/init.d/sing-box
+}
+
 install_dependencies(){
-  info '检查轻量依赖（不安装 net-tools、lsof 等非必要组件）...'
+  info '检查轻量依赖...'
   
-  # 1. 安装基础依赖
   if is_alpine; then
     command -v apk >/dev/null 2>&1 || { err '未找到 apk'; return 1; }
     apk add --no-cache bash curl jq openssl ca-certificates iproute2 >/dev/null
     update-ca-certificates >/dev/null 2>&1 || true
+    
+    info '通过 Alpine APK 安装最新版 sing-box...'
+    # 优先尝试从 edge/community 或 edge/testing 获取最新内核（支持 AnyTLS 完整特性）
+    if ! apk add --no-cache sing-box --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community \
+         --repository=https://dl-cdn.alpinelinux.org/alpine/edge/testing >/dev/null 2>&1; then
+      warn 'Edge 源拉取失败，尝试默认仓库安装...'
+      apk add --no-cache sing-box >/dev/null || {
+        err 'APK 仓库未提供 sing-box。请检查 /etc/apk/repositories 是否启用了 community 源。'
+        return 1
+      }
+    fi
+    ensure_alpine_service
+
   elif command -v apt-get >/dev/null 2>&1; then
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl jq openssl ca-certificates iproute2
+    if ! command -v sing-box >/dev/null 2>&1 || ! sing-box version | grep -qi 'beta\|alpha'; then
+      info '正在安装 Sing-box Beta 内核...'
+      curl -fsSL https://sing-box.app/install.sh | sh -s -- --beta
+    fi
   elif command -v dnf >/dev/null 2>&1; then
     dnf install -y curl jq openssl ca-certificates iproute
+    if ! command -v sing-box >/dev/null 2>&1 || ! sing-box version | grep -qi 'beta\|alpha'; then
+      curl -fsSL https://sing-box.app/install.sh | sh -s -- --beta
+    fi
   elif command -v yum >/dev/null 2>&1; then
     yum install -y curl jq openssl ca-certificates iproute
+    if ! command -v sing-box >/dev/null 2>&1 || ! sing-box version | grep -qi 'beta\|alpha'; then
+      curl -fsSL https://sing-box.app/install.sh | sh -s -- --beta
+    fi
   else
     err '暂不支持此发行版的依赖安装。'; return 1
-  fi
-
-  # 2. 统一使用官方脚本安装 Beta 版内核 (解决卡顿和 Alpine 权限问题)
-  # 官方脚本原生支持 Alpine (OpenRC) 且默认配置为 Root 运行守护进程
-  if ! command -v sing-box >/dev/null 2>&1 || ! sing-box version | grep -qi 'beta\|alpha'; then
-    info '正在安装 Sing-box Beta 内核...'
-    curl -fsSL https://sing-box.app/install.sh | sh -s -- --beta
   fi
 
   command -v sing-box >/dev/null 2>&1 || { err 'sing-box 内核安装失败'; return 1; }
@@ -86,7 +123,6 @@ install_dependencies(){
 }
 
 register_shortcut(){
-  # 仅保存当前脚本，不在每次启动时联网下载。
   if [[ -f "$0" && "$0" != "$LOCAL_SCRIPT_PATH" ]]; then
     cp -f "$0" "$LOCAL_SCRIPT_PATH" 2>/dev/null || true
     chmod 700 "$LOCAL_SCRIPT_PATH" 2>/dev/null || true
@@ -116,7 +152,6 @@ open_firewall_port(){
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q active; then
     ufw allow "$p/tcp" >/dev/null 2>&1 || true
   elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
-    # 修复：补全了 --zone=public 参数，避免在部分系统中放行失效
     firewall-cmd --zone=public --add-port="$p/tcp" --permanent >/dev/null 2>&1 || true
     firewall-cmd --reload >/dev/null 2>&1 || true
   else
@@ -146,7 +181,12 @@ write_and_apply(){
   local inbounds="$1" metadata="$2" tmp
   mkdir -p "$(dirname "$CONFIG_PATH")"
   tmp=$(mktemp "${CONFIG_PATH}.XXXXXX")
-  jq -n --argjson ib "$inbounds" '{log:{level:"warn",timestamp:false},inbounds:$ib}' > "$tmp"
+  # 显式补全 outbounds (direct)，防止部分内核版本缺少默认出站导致断网
+  jq -n --argjson ib "$inbounds" '{
+    log: {level: "warn", timestamp: false},
+    inbounds: $ib,
+    outbounds: [{type: "direct", tag: "direct"}]
+  }' > "$tmp"
   if ! sing-box check -c "$tmp"; then
     rm -f "$tmp"; err '配置校验失败，原配置未覆盖。'; return 1
   fi
@@ -261,8 +301,8 @@ show_status(){
 
 show_logs(){
   if command -v journalctl >/dev/null 2>&1; then journalctl -u "$SERVICE_NAME" -n 80 --no-pager
-  elif [[ -f /var/log/sing-box/current ]]; then tail -n 80 /var/log/sing-box/current
-  else warn '当前服务未配置可读取的日志文件；可使用 rc-service sing-box status 检查状态。'; fi
+  elif [[ -f /var/log/sing-box.log ]]; then tail -n 80 /var/log/sing-box.log
+  else warn '当前服务未生成日志文件；可使用 rc-service sing-box status 检查状态。'; fi
   pause
 }
 
@@ -288,7 +328,6 @@ remove_nodes_keep_core(){
     *) warn '无效选项'; pause; return ;;
   esac
   echo "$newcfg" | sing-box check -c /dev/stdin >/dev/null 2>&1 || {
-    # sing-box check 的部分版本不接受 stdin，改用临时文件验证。
     local tmpcheck; tmpcheck=$(mktemp); printf '%s\n' "$newcfg" > "$tmpcheck"
     if ! sing-box check -c "$tmpcheck"; then rm -f "$tmpcheck"; err '新配置校验失败，未执行删除'; pause; return; fi
     rm -f "$tmpcheck"
@@ -319,10 +358,9 @@ uninstall_all(){
   if is_alpine; then
     if command -v apk >/dev/null 2>&1; then apk del sing-box >/dev/null 2>&1 || true; fi
     rm -f /usr/bin/sing-box /usr/local/bin/sing-box
-    rm -f /etc/init.d/sing-box
+    rm -f /etc/init.d/sing-box /var/log/sing-box.log
   else
     if command -v apt-get >/dev/null 2>&1; then apt-get remove -y sing-box >/dev/null 2>&1 || true; fi
-    # sing-box.app installer commonly places the executable under /usr/local/bin.
     rm -f /usr/local/bin/sing-box /usr/bin/sing-box
     rm -f /etc/systemd/system/sing-box.service /lib/systemd/system/sing-box.service
     command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1 || true
