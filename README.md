@@ -28,5 +28,6 @@ any
 ### Debian/Ubuntu/Alpine
 
 ```bash
-if [ "$(id -u)" != 0 ]; then echo "请先使用 root 登录"; exit 1; fi; if command -v apk >/dev/null 2>&1; then apk add --no-cache bash curl ca-certificates; elif command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y bash curl ca-certificates; else echo "不支持的系统"; exit 1; fi && curl -fsSL "https://raw.githubusercontent.com/B-Zayne/One-Click-for-Anytls-Reality/refs/heads/main/Any-MultiOS-128M-V2.sh" -o /root/Any.sh && bash /root/Any.sh
+if [ "$(id -u)" != 0 ]; then echo "请先使用 root 登录"; exit 1; fi; if command -v apk >/dev/null 2>&1; then apk add --no-cache bash curl ca-certificates; elif command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y bash curl ca-certificates; else echo "不支持的系统"; exit 1; fi && curl -fsSL "https://raw.githubusercontent.com/B-Zayne/One-Click-for-Anytls-Reality/refs/heads/main/Any-MultiOS-128M-V2.sh" -o /root/any.sh && bash /root/any.sh
+
 
