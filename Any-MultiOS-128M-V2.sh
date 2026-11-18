@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # AnyTLS / AnyReality manager - Alpine / Debian / Ubuntu edition
-# Requires Bash, jq, curl, OpenSSL and sing-box. Low-dependency profile for small-memory VPS (128 MB is not runtime-tested).
+# Requires Bash, jq, curl, OpenSSL and sing-box. Low-dependency profile for small-memory VPS.
 set -Eeuo pipefail
 umask 077
 
@@ -10,7 +10,7 @@ readonly TLS_DIR=/root/AnyTLS/tls
 readonly SERVICE_NAME=sing-box
 readonly LOCAL_SCRIPT_PATH=/root/any.sh
 readonly REPO_URL=https://raw.githubusercontent.com/xymn2023/AnyTLS/main/Any.sh
-readonly VERSION=2.0.0
+readonly VERSION="2.0.1 (Fixed)"
 
 RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; BOLD=''; NC=''
 if [[ -t 1 ]]; then
@@ -53,56 +53,35 @@ service_action(){
   fi
 }
 
-ensure_alpine_service(){
-  command -v rc-service >/dev/null 2>&1 || return 0
-  if [[ ! -x /etc/init.d/sing-box ]]; then
-    mkdir -p /etc/init.d
-    cat > /etc/init.d/sing-box <<'EOF'
-#!/sbin/openrc-run
-description="sing-box service"
-command="/usr/bin/sing-box"
-command_args="run -c /etc/sing-box/config.json"
-command_background="yes"
-pidfile="/run/sing-box.pid"
-output_log="/var/log/sing-box.log"
-error_log="/var/log/sing-box.log"
-depend() { need net; }
-EOF
-    chmod 755 /etc/init.d/sing-box
-  fi
-}
-
 install_dependencies(){
   info '检查轻量依赖（不安装 net-tools、lsof 等非必要组件）...'
+  
+  # 1. 安装基础依赖
   if is_alpine; then
     command -v apk >/dev/null 2>&1 || { err '未找到 apk'; return 1; }
     apk add --no-cache bash curl jq openssl ca-certificates iproute2 >/dev/null
     update-ca-certificates >/dev/null 2>&1 || true
-    if ! command -v sing-box >/dev/null 2>&1; then
-      info '通过 Alpine APK 安装 sing-box...'
-      apk add --no-cache sing-box >/dev/null || {
-        err 'APK 仓库未提供 sing-box。请确认 Alpine community 仓库已启用。'
-        return 1
-      }
-    fi
   elif command -v apt-get >/dev/null 2>&1; then
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl jq openssl ca-certificates iproute2
-    if ! command -v sing-box >/dev/null 2>&1; then
-      curl -fsSL https://sing-box.app/install.sh | sh
-    fi
   elif command -v dnf >/dev/null 2>&1; then
     dnf install -y curl jq openssl ca-certificates iproute
-    command -v sing-box >/dev/null 2>&1 || curl -fsSL https://sing-box.app/install.sh | sh
   elif command -v yum >/dev/null 2>&1; then
     yum install -y curl jq openssl ca-certificates iproute
-    command -v sing-box >/dev/null 2>&1 || curl -fsSL https://sing-box.app/install.sh | sh
   else
     err '暂不支持此发行版的依赖安装。'; return 1
   fi
+
+  # 2. 统一使用官方脚本安装 Beta 版内核 (解决卡顿和 Alpine 权限问题)
+  # 官方脚本原生支持 Alpine (OpenRC) 且默认配置为 Root 运行守护进程
+  if ! command -v sing-box >/dev/null 2>&1 || ! sing-box version | grep -qi 'beta\|alpha'; then
+    info '正在安装 Sing-box Beta 内核...'
+    curl -fsSL https://sing-box.app/install.sh | sh -s -- --beta
+  fi
+
   command -v sing-box >/dev/null 2>&1 || { err 'sing-box 内核安装失败'; return 1; }
-  ensure_alpine_service
   command -v jq >/dev/null 2>&1 || { err 'jq 安装失败'; return 1; }
+  
   ok "依赖就绪：$(sing-box version 2>/dev/null | head -n 1)"
 }
 
@@ -137,7 +116,8 @@ open_firewall_port(){
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q active; then
     ufw allow "$p/tcp" >/dev/null 2>&1 || true
   elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
-    firewall-cmd --add-port="$p/tcp" --permanent >/dev/null 2>&1 || true
+    # 修复：补全了 --zone=public 参数，避免在部分系统中放行失效
+    firewall-cmd --zone=public --add-port="$p/tcp" --permanent >/dev/null 2>&1 || true
     firewall-cmd --reload >/dev/null 2>&1 || true
   else
     warn '未检测到受支持的主机防火墙；如云厂商有安全组，请手动放行 TCP 端口。'
