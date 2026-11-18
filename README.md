@@ -28,6 +28,6 @@ any
 ### Debian/Ubuntu/Alpine
 
 ```bash
-if [ "$(id -u)" != 0 ]; then echo "请先使用 root 登录"; exit 1; fi; if command -v apk >/dev/null 2>&1; then apk add --no-cache bash curl ca-certificates; elif command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y bash curl ca-certificates; else echo "不支持的系统"; exit 1; fi && curl -fsSL "https://raw.githubusercontent.com/B-Zayne/One-Click-for-Anytls-Reality/refs/heads/main/Any-MultiOS-128M-V2.sh" -o /root/any.sh && bash /root/any.sh
+sh -c 'set -e; [ "$(id -u)" -eq 0 ] || { echo "请使用 root 运行：sudo -i"; exit 1; }; URL="https://raw.githubusercontent.com/B-Zayne/One-Click-for-Anytls-Reality/refs/heads/main/Any-MultiOS-128M-V2.sh"; if [ -f /etc/alpine-release ]; then apk add --no-cache bash curl ca-certificates >/dev/null; elif command -v apt-get >/dev/null 2>&1; then if ! command -v bash >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq bash curl ca-certificates; fi; elif command -v dnf >/dev/null 2>&1; then dnf install -y bash curl ca-certificates; elif command -v yum >/dev/null 2>&1; then yum install -y bash curl ca-certificates; fi; curl -fsSL "$URL" -o /tmp/any.sh; exec bash /tmp/any.sh'
 
 
