@@ -1,9 +1,8 @@
 #!/bin/sh
 # ==============================================================================
-# Sing-Box (AnyTLS / AnyReality) 管理脚本
-#   - 兼容 Debian / Ubuntu / CentOS / Alpine (systemd 与 OpenRC)
-#   - 针对 128MB 小内存 VPS 做了专项优化
-#   - 支持「仅删除节点、保留内核」
+# Sing-Box (AnyTLS / AnyReality) 管理脚本 (Alpine / 128M 修订版)
+#   - 修复 Alpine 下 musl libc 导致 IPv4 无法联通的问题
+#   - 修复出站路由黑洞与 iptables 放行逻辑
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -22,7 +21,6 @@ if [ -z "${BASH_VERSION:-}" ]; then
     if [ -f "$0" ]; then
         exec bash "$0" "$@"
     fi
-    # 通过管道运行 (curl ... | sh) 时 $0 不是文件，先落盘再执行
     _boot_tmp="/tmp/.any_boot.sh"
     _boot_url="https://raw.githubusercontent.com/xymn2023/AnyTLS/main/Any.sh"
     if command -v curl >/dev/null 2>&1; then
@@ -38,9 +36,6 @@ fi
 # ------------------------------------------------------------------------------
 set -eo pipefail
 
-# ------------------------------------------------------------------------------
-# 全局变量与路径定义
-# ------------------------------------------------------------------------------
 readonly CONFIG_DIR="/etc/sing-box"
 readonly CONFIG_PATH="/etc/sing-box/config.json"
 readonly INFO_PATH="/root/.sb_info.json"
@@ -48,20 +43,18 @@ readonly TLS_DIR="/root/AnyTLS/tls"
 readonly SERVICE_NAME="sing-box"
 readonly LOCAL_SCRIPT_PATH="/root/any.sh"
 readonly SCRIPT_URL="https://raw.githubusercontent.com/xymn2023/AnyTLS/main/Any.sh"
-readonly SB_LOG_FILE="/var/log/sing-box.log"          # 仅 OpenRC 使用
+readonly SB_LOG_FILE="/var/log/sing-box.log"          
 readonly OPENRC_SCRIPT="/etc/init.d/sing-box"
 readonly SYSTEMD_DROPIN_DIR="/etc/systemd/system/sing-box.service.d"
-readonly LOW_MEM_THRESHOLD_MB=256                      # ≤ 此值视为小内存机器
+readonly LOW_MEM_THRESHOLD_MB=256                      
 
-# 运行期环境信息 (由 detect_env 填充)
 IS_ALPINE=0
 OS_NAME="linux"
-INIT_SYSTEM="none"       # systemd / openrc / none
+INIT_SYSTEM="none"       
 MEM_TOTAL_MB=0
 LOW_MEM=0
 SB_BIN=""
 
-# 颜色与样式
 readonly RED='\033[0;31m'
 readonly GREEN='\033[0;32m'
 readonly YELLOW='\033[0;33m'
@@ -70,9 +63,6 @@ readonly CYAN='\033[0;36m'
 readonly BOLD='\033[1m'
 readonly NC='\033[0m'
 
-# ------------------------------------------------------------------------------
-# 辅助 UI 与工具函数
-# ------------------------------------------------------------------------------
 log_info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
 log_success() { echo -e "${GREEN}[OK]${NC} $1"; }
 log_warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
@@ -97,9 +87,6 @@ check_root() {
     fi
 }
 
-# ------------------------------------------------------------------------------
-# 环境检测：发行版 / 初始化系统 / 内存
-# ------------------------------------------------------------------------------
 detect_env() {
     if [[ -f /etc/alpine-release ]]; then
         IS_ALPINE=1
@@ -124,16 +111,12 @@ detect_env() {
     SB_BIN=$(command -v sing-box 2>/dev/null || true)
 }
 
-# Go 运行时内存上限 (MiB)：约为物理内存的 55%，最低 40
 calc_go_mem_limit() {
     local lim=$(( MEM_TOTAL_MB * 55 / 100 ))
     if [[ $lim -lt 40 ]]; then lim=40; fi
     echo "$lim"
 }
 
-# ------------------------------------------------------------------------------
-# 服务管理抽象层 (systemd / OpenRC)
-# ------------------------------------------------------------------------------
 svc_enable() {
     case "$INIT_SYSTEM" in
         systemd) systemctl daemon-reload; systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 ;;
@@ -188,11 +171,7 @@ svc_status() {
     esac
 }
 
-# ------------------------------------------------------------------------------
-# 强制性全局注册函数 ('any' 命令)
-# ------------------------------------------------------------------------------
 force_register_shortcut() {
-    # 仅当 $0 是真实文件时才复制 (避免 bash <(curl ...) 的管道被读空)
     if [[ -f "$0" && -s "$0" && "$(readlink -f "$0" 2>/dev/null || echo "$0")" != "$LOCAL_SCRIPT_PATH" ]]; then
         cp -f "$0" "$LOCAL_SCRIPT_PATH" 2>/dev/null || true
     fi
@@ -219,15 +198,11 @@ EOF
     done
 }
 
-# ------------------------------------------------------------------------------
-# 网络 / 端口 / 防火墙
-# ------------------------------------------------------------------------------
 validate_port() {
     local port="$1"
     [[ "$port" =~ ^[0-9]+$ ]] && [[ "$port" -ge 1 && "$port" -le 65535 ]]
 }
 
-# 检测端口占用并打印结果 (返回 0 = 可用, 1 = 被占用)
 check_and_print_port_status() {
     local port="$1" out="" is_busy=0
 
@@ -251,7 +226,6 @@ check_and_print_port_status() {
     return 0
 }
 
-# 获取公网 IP (多源 + 校验)
 get_public_ip() {
     local ip="" flag svc
     for flag in -4 -6; do
@@ -279,6 +253,9 @@ open_firewall_port() {
         firewall-cmd --zone=public --add-port="${port}/tcp" --permanent >/dev/null 2>&1 || true
         firewall-cmd --reload >/dev/null 2>&1 || true
         log_success "Firewalld 防火墙端口 ${port} 放行成功！"
+    elif command -v iptables &>/dev/null; then
+        iptables -I INPUT -p tcp --dport "${port}" -j ACCEPT >/dev/null 2>&1 || true
+        log_success "iptables 防火墙端口 ${port} 放行成功 (Alpine兼容)！"
     fi
 }
 
@@ -289,10 +266,11 @@ close_firewall_port() {
     elif _firewalld_active; then
         firewall-cmd --zone=public --remove-port="${port}/tcp" --permanent >/dev/null 2>&1 || true
         firewall-cmd --reload >/dev/null 2>&1 || true
+    elif command -v iptables &>/dev/null; then
+        iptables -D INPUT -p tcp --dport "${port}" -j ACCEPT >/dev/null 2>&1 || true
     fi
 }
 
-# 按 INFO 文件里记录的端口回收防火墙规则
 cleanup_firewall_rules() {
     [[ -f "$INFO_PATH" ]] || return 0
     local ports p
@@ -302,9 +280,6 @@ cleanup_firewall_rules() {
     done
 }
 
-# ------------------------------------------------------------------------------
-# 状态卡片
-# ------------------------------------------------------------------------------
 core_version() {
     [[ -n "$SB_BIN" ]] || return 0
     "$SB_BIN" version 2>/dev/null | awk 'NR==1{print $3}' || true
@@ -347,9 +322,6 @@ print_system_status() {
     echo -e "${CYAN}-----------------------------------------------------${NC}"
 }
 
-# ------------------------------------------------------------------------------
-# 依赖安装 (仅安装缺失项，节省时间/内存)
-# ------------------------------------------------------------------------------
 install_dependencies() {
     log_info "检查并安装必要依赖组件..."
 
@@ -358,7 +330,6 @@ install_dependencies() {
         command -v "$c" &>/dev/null || need+=("$c")
     done
 
-    # 端口检测工具：busybox (Alpine) 自带 netstat；其它系统缺失时补 iproute2
     local need_ss=0
     if ! command -v ss &>/dev/null && ! command -v netstat &>/dev/null && ! command -v lsof &>/dev/null; then
         need_ss=1
@@ -388,9 +359,6 @@ install_dependencies() {
     log_success "依赖安装完成。"
 }
 
-# ------------------------------------------------------------------------------
-# Swap (小内存保护)
-# ------------------------------------------------------------------------------
 setup_swap_if_needed() {
     [[ $LOW_MEM -eq 1 ]] || return 0
 
@@ -398,7 +366,6 @@ setup_swap_if_needed() {
     swap_kb=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo 2>/dev/null || true)
     [[ "${swap_kb:-0}" -eq 0 ]] || return 0
 
-    # 根分区若是内存文件系统 (Alpine diskless 模式)，建 Swap 无意义
     local root_fs
     root_fs=$(awk '$2=="/"{t=$3} END{print t}' /proc/mounts 2>/dev/null || true)
     if [[ "$root_fs" == "tmpfs" || "$root_fs" == "ramfs" || "$root_fs" == "rootfs" ]]; then
@@ -431,10 +398,6 @@ setup_swap_if_needed() {
     fi
 }
 
-# ------------------------------------------------------------------------------
-# Sing-Box 内核安装
-# ------------------------------------------------------------------------------
-# AnyTLS 入站需要 sing-box >= 1.12
 core_supports_anytls() {
     local v major rest minor
     v=$(core_version)
@@ -449,7 +412,6 @@ core_supports_anytls() {
     [[ "$major" -gt 1 || ( "$major" -eq 1 && "$minor" -ge 12 ) ]]
 }
 
-# 从 GitHub Release 下载 musl 构建 (适用于 Alpine)
 install_core_github_musl() {
     local arch
     case "$(uname -m)" in
@@ -491,7 +453,7 @@ install_core_alpine() {
         return 0
     fi
 
-    log_warn "apk 源中的 sing-box 不可用或版本过旧 (AnyTLS 需 ≥ 1.12)，改为下载 GitHub musl 版本..."
+    log_warn "apk 源中的 sing-box 不可用或版本过旧，改为下载 GitHub musl 版本..."
     apk del sing-box >/dev/null 2>&1 || true
     hash -r
     install_core_github_musl
@@ -506,7 +468,6 @@ install_core() {
     fi
 }
 
-# 确保内核可用：已存在则默认沿用，避免重复下载
 ensure_core() {
     hash -r
     SB_BIN=$(command -v sing-box 2>/dev/null || true)
@@ -540,9 +501,6 @@ ensure_core() {
     fi
 }
 
-# ------------------------------------------------------------------------------
-# 服务定义与低内存调优
-# ------------------------------------------------------------------------------
 write_openrc_service() {
     local env_lines=""
     if [[ $LOW_MEM -eq 1 ]]; then
@@ -569,7 +527,6 @@ depend() {
 }
 
 start_pre() {
-    # 日志超过 5MB 自动清空，防止撑满小硬盘/内存盘
     if [ -f "${SB_LOG_FILE}" ] && [ "\$(wc -c < "${SB_LOG_FILE}")" -gt 5242880 ]; then
         : > "${SB_LOG_FILE}"
     fi
@@ -604,9 +561,6 @@ setup_service() {
     esac
 }
 
-# ------------------------------------------------------------------------------
-# 证书生成模块
-# ------------------------------------------------------------------------------
 generate_cert() {
     local sni="$1"
     mkdir -p "$TLS_DIR"
@@ -624,9 +578,6 @@ generate_cert() {
     fi
 }
 
-# ------------------------------------------------------------------------------
-# 安装与节点配置
-# ------------------------------------------------------------------------------
 install_node() {
     clear
     print_header "配置 Sing-Box 节点协议"
@@ -659,7 +610,6 @@ install_node() {
     local log_level="info"
     [[ $LOW_MEM -eq 1 ]] && log_level="warn"
 
-    # 1) 配置 AnyReality
     if [[ "$mode" == "1" || "$mode" == "3" ]]; then
         echo -e "\n${YELLOW}>>>> 开始配置 AnyReality <<<<${NC}"
 
@@ -699,7 +649,7 @@ install_node() {
             --arg id "$short_id" \
             '{
                 type: "anytls",
-                listen: "::",
+                listen: "0.0.0.0",
                 listen_port: ($p | tonumber),
                 users: [{ name: "user", password: $w }],
                 padding_scheme: ["stop=8","0=30-30","1=100-400","2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000","3=9-9,500-1000","4=500-1000","5=500-1000","6=500-1000","7=500-1000"],
@@ -723,7 +673,6 @@ install_node() {
         log_success "AnyReality 参数配置完成！"
     fi
 
-    # 2) 配置 AnyTLS
     if [[ "$mode" == "2" || "$mode" == "3" ]]; then
         echo -e "\n${YELLOW}>>>> 开始配置 AnyTLS <<<<${NC}"
 
@@ -761,7 +710,7 @@ install_node() {
             --arg key "$TLS_DIR/server.key" \
             '{
                 type: "anytls",
-                listen: "::",
+                listen: "0.0.0.0",
                 listen_port: ($p | tonumber),
                 users: [{ password: $w }],
                 padding_scheme: ["stop=8","0=30-80","1=100-400","2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000","3=9-9,500-1000","4=500-1000","5=500-1000","6=500-1000","7=500-1000"],
@@ -780,12 +729,16 @@ install_node() {
         log_success "AnyTLS 参数配置完成！"
     fi
 
-    # 保存配置
     echo "$info_json" > "$INFO_PATH"
     chmod 600 "$INFO_PATH"
     mkdir -p "$CONFIG_DIR"
+    
     jq -n --argjson ib "$inbounds_json" --arg lv "$log_level" \
-        '{log: {level: $lv, timestamp: true}, inbounds: $ib}' > "$CONFIG_PATH"
+        '{
+            log: {level: $lv, timestamp: true}, 
+            inbounds: $ib,
+            outbounds: [{type: "direct", tag: "direct"}]
+        }' > "$CONFIG_PATH"
 
     log_info "正在校验配置文件..."
     if ! "$SB_BIN" check -c "$CONFIG_PATH"; then
@@ -811,9 +764,6 @@ install_node() {
     show_links
 }
 
-# ------------------------------------------------------------------------------
-# 节点链接展示
-# ------------------------------------------------------------------------------
 show_links() {
     clear
     if [[ ! -f "$INFO_PATH" ]]; then
@@ -825,7 +775,7 @@ show_links() {
     local ip host
     ip=$(get_public_ip)
     host="$ip"
-    [[ "$ip" == *:* ]] && host="[${ip}]"      # IPv6 地址需要加方括号
+    [[ "$ip" == *:* ]] && host="[${ip}]"      
 
     print_header "已生成的节点连接信息"
     echo
@@ -855,9 +805,6 @@ show_links() {
     pause
 }
 
-# ------------------------------------------------------------------------------
-# 服务管理与状态模块
-# ------------------------------------------------------------------------------
 manage_service() {
     clear
     print_header "服务控制面板"
@@ -908,7 +855,6 @@ show_logs() {
         print_header "正在查看实时日志 (退出日志预览按 Ctrl+C)"
         echo
 
-        # 日志查看期间让 Ctrl+C 只终止 tail/journalctl，不退出整个脚本
         trap ':' INT
         if [[ "$INIT_SYSTEM" == "systemd" ]] && command -v journalctl &>/dev/null; then
             journalctl -u "$SERVICE_NAME" -e -f -n 50 || true
@@ -933,10 +879,6 @@ show_logs() {
     done
 }
 
-# ------------------------------------------------------------------------------
-# 卸载模块
-# ------------------------------------------------------------------------------
-# 仅删除节点：保留内核、服务定义、快捷命令与本脚本
 remove_node_keep_core() {
     clear
     print_header "仅删除节点 (保留内核)" "$YELLOW"
@@ -992,20 +934,17 @@ uninstall_all() {
 
         remove_core_packages
 
-        # 服务定义
         rm -f "/etc/systemd/system/${SERVICE_NAME}.service" "$OPENRC_SCRIPT"
         rm -rf "$SYSTEMD_DROPIN_DIR"
 
-        # 二进制与快捷命令
         rm -f /usr/bin/"$SERVICE_NAME" /usr/local/bin/"$SERVICE_NAME" /usr/local/bin/any /usr/bin/any
         local legacy
-        for legacy in /usr/local/bin/a /usr/bin/a; do        # 兼容旧版脚本遗留的 a 命令
+        for legacy in /usr/local/bin/a /usr/bin/a; do        
             if [[ -f "$legacy" ]] && grep -q "any.sh" "$legacy" 2>/dev/null; then
                 rm -f "$legacy"
             fi
         done
 
-        # 配置与数据
         rm -rf "$CONFIG_DIR" /var/lib/"$SERVICE_NAME" "$INFO_PATH" /root/AnyTLS "$SB_LOG_FILE" "$LOCAL_SCRIPT_PATH"
 
         [[ "$INIT_SYSTEM" == "systemd" ]] && systemctl daemon-reload || true
@@ -1018,9 +957,6 @@ uninstall_all() {
     fi
 }
 
-# ------------------------------------------------------------------------------
-# 主菜单循环
-# ------------------------------------------------------------------------------
 main_menu() {
     check_root
     detect_env
@@ -1033,7 +969,6 @@ main_menu() {
         echo -e "${BOLD}       Sing-Box (AnyTLS / AnyReality) 管理脚本       ${NC}"
         echo -e "         快捷指令: 在终端输入 ${YELLOW}${BOLD}any${NC} 即可快速打开"
 
-        # 每轮刷新内核路径 (安装/卸载后会变化)
         hash -r
         SB_BIN=$(command -v sing-box 2>/dev/null || true)
         print_system_status
