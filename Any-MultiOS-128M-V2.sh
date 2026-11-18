@@ -1,8 +1,9 @@
 #!/bin/sh
 # ==============================================================================
-# Sing-Box (AnyTLS / AnyReality) 管理脚本 (Alpine / 128M 修订版)
-#   - 修复 Alpine 下 musl libc 导致 IPv4 无法联通的问题
-#   - 修复出站路由黑洞与 iptables 放行逻辑
+# Sing-Box (AnyTLS / AnyReality) 管理脚本 (Alpine / 128M 最终修复版)
+#   - 兼容 Debian / Ubuntu / CentOS / Alpine (systemd 与 OpenRC)
+#   - 修复 Alpine 下 IPv6 双栈监听、ip6tables 防火墙与 DNS 路由黑洞问题
+#   - 针对 128MB 小内存 VPS 做了专项优化
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -255,7 +256,8 @@ open_firewall_port() {
         log_success "Firewalld 防火墙端口 ${port} 放行成功！"
     elif command -v iptables &>/dev/null; then
         iptables -I INPUT -p tcp --dport "${port}" -j ACCEPT >/dev/null 2>&1 || true
-        log_success "iptables 防火墙端口 ${port} 放行成功 (Alpine兼容)！"
+        command -v ip6tables &>/dev/null && ip6tables -I INPUT -p tcp --dport "${port}" -j ACCEPT >/dev/null 2>&1 || true
+        log_success "iptables 防火墙端口 ${port} 双栈放行成功！"
     fi
 }
 
@@ -268,6 +270,7 @@ close_firewall_port() {
         firewall-cmd --reload >/dev/null 2>&1 || true
     elif command -v iptables &>/dev/null; then
         iptables -D INPUT -p tcp --dport "${port}" -j ACCEPT >/dev/null 2>&1 || true
+        command -v ip6tables &>/dev/null && ip6tables -D INPUT -p tcp --dport "${port}" -j ACCEPT >/dev/null 2>&1 || true
     fi
 }
 
@@ -649,7 +652,7 @@ install_node() {
             --arg id "$short_id" \
             '{
                 type: "anytls",
-                listen: "0.0.0.0",
+                listen: "::",
                 listen_port: ($p | tonumber),
                 users: [{ name: "user", password: $w }],
                 padding_scheme: ["stop=8","0=30-30","1=100-400","2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000","3=9-9,500-1000","4=500-1000","5=500-1000","6=500-1000","7=500-1000"],
@@ -710,7 +713,7 @@ install_node() {
             --arg key "$TLS_DIR/server.key" \
             '{
                 type: "anytls",
-                listen: "0.0.0.0",
+                listen: "::",
                 listen_port: ($p | tonumber),
                 users: [{ password: $w }],
                 padding_scheme: ["stop=8","0=30-80","1=100-400","2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000","3=9-9,500-1000","4=500-1000","5=500-1000","6=500-1000","7=500-1000"],
@@ -735,9 +738,14 @@ install_node() {
     
     jq -n --argjson ib "$inbounds_json" --arg lv "$log_level" \
         '{
-            log: {level: $lv, timestamp: true}, 
+            log: {level: $lv, timestamp: true},
+            dns: {
+                servers: [{tag: "dns_direct", address: "8.8.8.8", detour: "direct"}],
+                final: "dns_direct"
+            },
             inbounds: $ib,
-            outbounds: [{type: "direct", tag: "direct"}]
+            outbounds: [{type: "direct", tag: "direct"}],
+            route: {final: "direct", auto_detect_interface: true}
         }' > "$CONFIG_PATH"
 
     log_info "正在校验配置文件..."
